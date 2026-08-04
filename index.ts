@@ -15,6 +15,16 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { SocksDispatcher } from "./socks-dispatcher.ts";
 
+// 日志开关：默认静默（console 输出会污染 pi 的 TUI 输入框）。
+// 需要调试时设置环境变量 PI_MODEL_PROXY_DEBUG=1。
+const DEBUG = process.env.PI_MODEL_PROXY_DEBUG === "1";
+const log = (...args: unknown[]) => {
+  if (DEBUG) console.log("[model-proxy]", ...args);
+};
+const logError = (...args: unknown[]) => {
+  if (DEBUG) console.error("[model-proxy]", ...args);
+};
+
 /**
  * pi-model-proxy：按模型路由代理。
  *
@@ -91,7 +101,7 @@ function loadRules(): ProxyRule[] {
             : null;
       }
     } catch (err) {
-      console.error("[model-proxy] settings.json parse error:", err);
+      logError("settings.json parse error:", err);
     }
   }
   const rules = Object.entries(merged).map(([pattern, url]) => ({
@@ -172,7 +182,7 @@ export default function (pi: ExtensionAPI) {
         }
       }
       const msg = lines.join("\n");
-      console.log(msg);
+      log(msg);
       ctx.ui.notify(msg, "info");
     },
   });
@@ -185,7 +195,7 @@ export default function (pi: ExtensionAPI) {
       else if (arg === "off") commandDisabled = true;
       else commandDisabled = !commandDisabled;
       const state = commandDisabled ? "off (direct)" : "on (rules active)";
-      console.log(`[model-proxy] /noproxy -> ${state}`);
+      log(`/noproxy -> ${state}`);
       ctx.ui.notify(`model-proxy: ${state}`, "info");
     },
   });
@@ -197,7 +207,7 @@ export default function (pi: ExtensionAPI) {
       const url = args.trim();
       if (!url) {
         allProxyUrl = null;
-        console.log("[model-proxy] /allproxy -> off (rules active)");
+        log("/allproxy -> off (rules active)");
         ctx.ui.notify("model-proxy: global proxy off", "info");
         return;
       }
@@ -206,7 +216,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       allProxyUrl = url;
-      console.log(`[model-proxy] /allproxy -> ${url} (all models)`);
+      log(`/allproxy -> ${url} (all models)`);
       ctx.ui.notify(`model-proxy: all models -> ${url}`, "info");
     },
   });
@@ -234,8 +244,8 @@ export default function (pi: ExtensionAPI) {
       options?: SimpleStreamOptions,
     ): AssistantMessageEventStream => {
       const proxyUrl = resolveProxyUrl(pi, model.provider, model.id);
-      console.log(
-        `[model-proxy] route: ${model.provider}/${model.id} -> ${proxyUrl ?? "direct"}`,
+      log(
+        `route: ${model.provider}/${model.id} -> ${proxyUrl ?? "direct"}`,
       );
       if (proxyUrl) {
         const dispatcher = getDispatcher(proxyUrl);
@@ -249,14 +259,14 @@ export default function (pi: ExtensionAPI) {
                   dispatcher: dispatcher as never,
                 } as never)) as unknown as Response;
               } catch (err) {
-                console.error("[model-proxy] proxyFetch failed:", err);
+                logError("proxyFetch failed:", err);
                 throw err;
               }
             }) as never,
           });
         }
-        console.warn(
-          `[model-proxy] unsupported proxy URL, going direct: ${proxyUrl}`,
+        logError(
+          `unsupported proxy URL, going direct: ${proxyUrl}`,
         );
       }
       return api.streamSimple(model, context, options);
@@ -280,8 +290,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   const ruleCount = loadRules().length;
-  console.log(
-    `[model-proxy] loaded (${ruleCount} rules from settings.json). ` +
+  log(
+    `loaded (${ruleCount} rules from settings.json). ` +
       `--noproxy / /noproxy to disable.`,
   );
 }
