@@ -1,0 +1,15 @@
+{
+  "name": "pi-model-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "socks-proxy-agent": "^8.0.5",
+    "undici": "^7.0.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.83.0",
+    "@earendil-works/pi-coding-agent": "^0.83.0",
+    "@types/node": "^26.1.2"
+  }
+}
