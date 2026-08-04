@@ -1,36 +1,44 @@
 # pi-model-proxy
 
-[Pi](https://github.com/earendil-works/pi) coding agent 的按模型路由代理扩展。为不同模型配置不同的代理策略（SOCKS5 / HTTP），支持会话级临时开关，无需修改任何 provider 配置。
+Per-model proxy routing extension for the [Pi](https://github.com/earendil-works/pi) coding agent. Route each model through its own proxy (SOCKS5 / HTTP) with per-session toggles — no provider config changes required.
 
-## 特性
+## Features
 
-- **按模型规则路由**：`provider/model` 模式匹配（`*` 通配），每个模型可独立指定代理或直连
-- **多协议支持**：`socks5h://`、`http://`、`https://` 代理，或 `direct` 显式直连
-- **配置即改即生效**：读取 `settings.json` 的 `model-proxy` 节点，修改文件后自动重载（mtime 检测）
-- **启动开关**：`pi --noproxy` 禁用全部代理规则
-- **会话内命令**：
-  - `/allproxy <url>` — 全局强制代理（临时，不写配置）
-  - `/noproxy [on|off]` — 禁用/恢复规则
-  - `/proxy [provider/model]` — 查看当前代理状态（含环境变量）
-- **主/子 agent 通用**：子 agent 与主 agent 共享请求链路，规则自动生效
+- **Per-model rules**: match `provider/model` patterns (`*` wildcard), each model gets its own proxy or direct connection
+- **Multiple protocols**: `socks5h://`, `http://`, `https://` proxies, or `direct` to force a direct connection
+- **Hot-reload config**: rules are read from the `model-proxy` key in `settings.json`; editing the file reloads them automatically (mtime-based)
+- **Startup flag**: `pi --noproxy` disables all proxy rules
+- **Session commands**:
+  - `/allproxy <url>` — force ALL models through one proxy (session-only, nothing persisted)
+  - `/noproxy [on|off]` — disable/restore rules
+  - `/proxy [provider/model]` — show current proxy status (including environment variables)
+- **Works for subagents**: child agents share the main agent's request pipeline, rules apply automatically
 
-## 安装
+## Install
 
 ```bash
-# 全局安装（~/.pi/agent/extensions/）
+# Global install (~/.pi/agent/extensions/)
 mkdir -p ~/.pi/agent/extensions/pi-model-proxy
 cd ~/.pi/agent/extensions/pi-model-proxy
-# 将本项目文件复制到该目录（index.ts、socks-dispatcher.ts、package.json）
+# copy this package's files (index.ts, socks-dispatcher.ts, package.json) here
 npm install
 ```
 
-然后在 pi 中 `/reload`，或在下次启动时自动加载。启动日志中看到 `[model-proxy] loaded` 即成功。
+Then run `/reload` in pi, or restart — you should see `[model-proxy] loaded` in the startup log.
 
-> 项目级安装：放到 `.pi/extensions/pi-model-proxy/`（需先信任项目目录）。
+> Project-local install: put it in `.pi/extensions/pi-model-proxy/` (requires trusting the project first).
 
-## 配置
+Or install as a pi package:
 
-在 `settings.json`（全局 `~/.pi/agent/settings.json` 或项目 `.pi/settings.json`，项目覆盖全局）中添加 `model-proxy` 节点：
+```bash
+pi install npm:pi-model-proxy
+# or from git
+pi install git:github.com/leench/pi-model-proxy
+```
+
+## Configuration
+
+Add a `model-proxy` key to `settings.json` (global `~/.pi/agent/settings.json` or project `.pi/settings.json`; project overrides global):
 
 ```json
 {
@@ -44,63 +52,63 @@ npm install
 }
 ```
 
-### 规则语法
+### Rule syntax
 
-- **key**：`provider/模型模式`，`*` 通配任意字符（如 `openai-codex/gpt*`、`opencode-go/*`）
-- **value**：
-  - 代理 URL：`socks5h://`（推荐，远端 DNS 解析）、`socks5://`（自动归一化为 socks5h）、`http://`、`https://`
-  - `direct`：显式直连
-- 按书写顺序**首个命中**生效；不在列表中的模型默认直连
+- **key**: `provider/model-pattern`, `*` matches any characters (e.g. `openai-codex/gpt*`, `opencode-go/*`)
+- **value**:
+  - Proxy URL: `socks5h://` (recommended, remote DNS resolution), `socks5://` (normalized to socks5h), `http://`, `https://`
+  - `direct`: explicitly bypass the proxy
+- First matching rule in declaration order wins; models not listed go direct by default
 
-### 优先级
+### Priority
 
 ```
---noproxy / /noproxy（禁用） > /allproxy（全局代理） > settings 规则 > 默认直连
+--noproxy / /noproxy (disable) > /allproxy (global proxy) > settings rules > direct (default)
 ```
 
-## 命令
+## Commands
 
-| 命令 | 说明 |
+| Command | Description |
 |---|---|
-| `/proxy` | 查看当前状态：flag、开关、allproxy、环境变量、规则列表 |
-| `/proxy openai-codex/gpt-5.6-luna` | 附带参数时额外显示该模型的实际解析结果 |
-| `/allproxy http://127.0.0.1:7890` | 全部模型强制走该代理（会话级临时，不写配置） |
-| `/allproxy` | 取消全局代理，恢复规则 |
-| `/noproxy` | 切换禁用/恢复（不带参数时 toggle） |
-| `/noproxy on` / `/noproxy off` | 显式设置 |
-| `pi --noproxy` | 启动时禁用全部代理规则 |
+| `/proxy` | Show current status: flags, toggles, allproxy, environment variables, rule list |
+| `/proxy openai-codex/gpt-5.6-luna` | With an argument, also shows the resolved route for that model |
+| `/allproxy http://127.0.0.1:7890` | Force ALL models through this proxy (session-only, not persisted) |
+| `/allproxy` | Cancel the global proxy, fall back to rules |
+| `/noproxy` | Toggle disable/restore (toggles when no argument) |
+| `/noproxy on` / `/noproxy off` | Explicitly set |
+| `pi --noproxy` | Disable all proxy rules at startup |
 
-## 架构与原理
+## How it works
 
-pi 的 provider-composer 允许扩展通过 `pi.registerProvider(name, { api, streamSimple })` 覆盖指定 provider 在**指定 API 类型**上的流式实现。本扩展在 `streamSimple` 钩子中按模型 id 解析代理规则，命中时用 undici fetch + 自定义 dispatcher 注入传输层：
+Pi's provider-composer lets extensions override the streaming implementation for a provider on a **specific API type** via `pi.registerProvider(name, { api, streamSimple })`. This extension resolves proxy rules by model id inside the `streamSimple` hook and injects the transport layer with undici fetch + a custom dispatcher:
 
 - `http://` / `https://` → undici `ProxyAgent`
-- `socks5h://` → 内置 `SocksDispatcher`（基于 `socks-proxy-agent` 实现 undici Dispatcher 接口，转发为 node http/https.request）
+- `socks5h://` → built-in `SocksDispatcher` (implements the undici Dispatcher interface over `socks-proxy-agent`, forwarded to node http/https.request)
 
 ```typescript
 pi.registerProvider("openai-codex", {
   api: "openai-codex-responses",
   streamSimple: (model, context, options) => {
     const proxy = resolveProxy(model.provider, model.id);
-    // proxy 命中 → 用注入 dispatcher 的 fetch；否则直连
+    // proxy matched → fetch with injected dispatcher; otherwise direct
   },
 });
 ```
 
-### 环境变量
+### Environment variables
 
-pi 启动时全局安装 `EnvHttpProxyAgent`（undici），所有 fetch 默认读取 `HTTP_PROXY` / `HTTPS_PROXY` 环境变量。因此：
+Pi installs an `EnvHttpProxyAgent` globally at startup, so all fetch calls read `HTTP_PROXY` / `HTTPS_PROXY`. This means:
 
-- 被扩展接管的模型走显式 dispatcher（规则优先，不受环境变量影响）
-- **不被接管的模型**（见下方限制）走默认链路 —— 设置了代理环境变量时它们也会走 HTTP 代理
+- Models **intercepted** by this extension use the explicit dispatcher (rules win, environment not consulted)
+- Models **not intercepted** (see limits below) use the default pipeline — if proxy environment variables are set, they will go through the HTTP proxy
 
-## 已知限制
+## Known limitations
 
-- **API 类型接管限制**：一个 provider 只能注册一种 `api` 的钩子。目前接管：
-  - `opencode-go` / `openai` → `openai-responses`（gpt-* 等）
-  - `openai-codex` → `openai-codex-responses`（gpt-5.6-luna 等）
-  - 不接管 `openai-completions`（opencode-go/deepseek-*、glm-*）与 `anthropic-messages`（qwen、minimax）—— 这些模型走 pi 默认链路（直连，或随 `HTTP_PROXY` 环境变量走代理）
-- 若要覆盖这些 api，需要再扩展对应 api 的注册（欢迎 PR）
+- **One API type per provider**: an extension can only register a hook for one `api` per provider. Currently intercepted:
+  - `opencode-go` / `openai` → `openai-responses` (gpt-* etc.)
+  - `openai-codex` → `openai-codex-responses` (gpt-5.6-luna etc.)
+  - NOT intercepted: `openai-completions` (opencode-go/deepseek-*, glm-*) and `anthropic-messages` (qwen, minimax) — those models use pi's default pipeline (direct, or via `HTTP_PROXY` if set)
+- To cover these API types, register hooks for them as well (PRs welcome)
 
 ## License
 

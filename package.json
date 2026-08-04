@@ -12,7 +12,8 @@
   "files": [
     "index.ts",
     "socks-dispatcher.ts",
-    "README.md"
+    "README.md",
+    "README.zh-CN.md"
   ],
   "pi": {
     "extensions": [
