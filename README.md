@@ -37,7 +37,7 @@ npm install
   "model-proxy": {
     "openai-codex/*":       "socks5h://127.0.0.1:7890",
     "openai/*":             "socks5h://127.0.0.1:7890",
-    "opencode-go/gpt*":     "socks5h://192.168.100.1:7890",
+    "opencode-go/gpt*":     "socks5h://192.168.1.100:7890",
     "opencode-go/deepseek*": "direct",
     "opencode-go/glm*":     "direct"
   }

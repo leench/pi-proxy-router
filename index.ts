@@ -23,7 +23,7 @@ import { SocksDispatcher } from "./socks-dispatcher.ts";
  *
  *   "model-proxy": {
  *     "openai/*":            "socks5h://localhost:7890",
- *     "opencode-go/gpt*":    "socks5h://192.168.100.1:7890",
+ *     "opencode-go/gpt*":    "socks5h://192.168.1.100:7890",
  *     "opencode-go/glm*":    "direct"     // 显式直连
  *   }
  *

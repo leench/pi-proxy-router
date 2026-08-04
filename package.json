@@ -1,15 +1,33 @@
 {
   "name": "pi-model-proxy",
   "version": "1.0.0",
-  "private": true,
+  "description": "Per-model proxy routing for pi: route each model through its own SOCKS5/HTTP proxy, with session commands (/proxy, /noproxy, /allproxy) and settings.json rules",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "proxy",
+    "socks5"
+  ],
   "type": "module",
+  "files": [
+    "index.ts",
+    "socks-dispatcher.ts",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
   "dependencies": {
     "socks-proxy-agent": "^8.0.5",
     "undici": "^7.0.0"
   },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^0.83.0",
-    "@earendil-works/pi-coding-agent": "^0.83.0",
     "@types/node": "^26.1.2"
   }
 }
