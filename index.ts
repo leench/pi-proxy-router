@@ -19,10 +19,10 @@ import { SocksDispatcher } from "./socks-dispatcher.ts";
 // 需要调试时设置环境变量 PI_MODEL_PROXY_DEBUG=1。
 const DEBUG = process.env.PI_MODEL_PROXY_DEBUG === "1";
 const log = (...args: unknown[]) => {
-  if (DEBUG) console.log("[model-proxy]", ...args);
+  if (DEBUG) console.log("[proxy-router]", ...args);
 };
 const logError = (...args: unknown[]) => {
-  if (DEBUG) console.error("[model-proxy]", ...args);
+  if (DEBUG) console.error("[proxy-router]", ...args);
 };
 
 /**
@@ -138,7 +138,7 @@ let allProxyUrl: string | null = null; // /allproxy 全局代理（最高优先�
 
 export default function (pi: ExtensionAPI) {
   pi.registerFlag("noproxy", {
-    description: "Disable model-proxy routing (all model requests go direct)",
+    description: "Disable proxy routing (all model requests go direct)",
     type: "boolean",
     default: false,
   });
@@ -149,7 +149,7 @@ export default function (pi: ExtensionAPI) {
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const target = args.trim();
       const lines: string[] = [];
-      lines.push("[model-proxy] status");
+      lines.push("[proxy-router] status");
       lines.push(`  --noproxy flag:  ${pi.getFlag("noproxy") ? "on (disabled)" : "off"}`);
       lines.push(`  /noproxy:        ${commandDisabled ? "off (direct)" : "on (rules active)"}`);
       lines.push(`  /allproxy:       ${allProxyUrl ?? "not set"}`);
@@ -196,7 +196,7 @@ export default function (pi: ExtensionAPI) {
       else commandDisabled = !commandDisabled;
       const state = commandDisabled ? "off (direct)" : "on (rules active)";
       log(`/noproxy -> ${state}`);
-      ctx.ui.notify(`model-proxy: ${state}`, "info");
+      ctx.ui.notify(`proxy-router: ${state}`, "info");
     },
   });
 
@@ -208,16 +208,16 @@ export default function (pi: ExtensionAPI) {
       if (!url) {
         allProxyUrl = null;
         log("/allproxy -> off (rules active)");
-        ctx.ui.notify("model-proxy: global proxy off", "info");
+        ctx.ui.notify("proxy-router: global proxy off", "info");
         return;
       }
       if (!/^(https?|socks5h?):\/\//i.test(url)) {
-        ctx.ui.notify(`model-proxy: invalid proxy URL: ${url}`, "error");
+        ctx.ui.notify(`proxy-router: invalid proxy URL: ${url}`, "error");
         return;
       }
       allProxyUrl = url;
       log(`/allproxy -> ${url} (all models)`);
-      ctx.ui.notify(`model-proxy: all models -> ${url}`, "info");
+      ctx.ui.notify(`proxy-router: all models -> ${url}`, "info");
     },
   });
 

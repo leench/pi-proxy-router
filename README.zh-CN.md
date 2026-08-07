@@ -24,7 +24,7 @@ cd ~/.pi/agent/extensions/pi-proxy-router
 npm install
 ```
 
-然后在 pi 中 `/reload`，或在下次启动时自动加载。启动日志中看到 `[model-proxy] loaded` 即成功。
+然后在 pi 中 `/reload`，或在下次启动时自动加载。启动日志中看到 `[proxy-router] loaded` 即成功。
 
 > 项目级安装：放到 `.pi/extensions/pi-proxy-router/`（需先信任项目目录）。
 

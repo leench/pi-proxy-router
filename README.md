@@ -24,7 +24,7 @@ cd ~/.pi/agent/extensions/pi-proxy-router
 npm install
 ```
 
-Then run `/reload` in pi, or restart — you should see `[model-proxy] loaded` in the startup log.
+Then run `/reload` in pi, or restart — you should see `[proxy-router] loaded` in the startup log.
 
 > Project-local install: put it in `.pi/extensions/pi-proxy-router/` (requires trusting the project first).
 
