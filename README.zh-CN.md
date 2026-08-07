@@ -1,4 +1,4 @@
-# pi-model-proxy
+# pi-proxy-router
 
 [Pi](https://github.com/earendil-works/pi) coding agent 的按模型路由代理扩展。为不同模型配置不同的代理策略（SOCKS5 / HTTP），支持会话级临时开关，无需修改任何 provider 配置。
 
@@ -18,22 +18,22 @@
 
 ```bash
 # 全局安装（~/.pi/agent/extensions/）
-mkdir -p ~/.pi/agent/extensions/pi-model-proxy
-cd ~/.pi/agent/extensions/pi-model-proxy
+mkdir -p ~/.pi/agent/extensions/pi-proxy-router
+cd ~/.pi/agent/extensions/pi-proxy-router
 # 将本项目文件复制到该目录（index.ts、socks-dispatcher.ts、package.json）
 npm install
 ```
 
 然后在 pi 中 `/reload`，或在下次启动时自动加载。启动日志中看到 `[model-proxy] loaded` 即成功。
 
-> 项目级安装：放到 `.pi/extensions/pi-model-proxy/`（需先信任项目目录）。
+> 项目级安装：放到 `.pi/extensions/pi-proxy-router/`（需先信任项目目录）。
 
 或作为 pi 包安装：
 
 ```bash
-pi install npm:pi-model-proxy
+pi install npm:pi-proxy-router
 # 或通过 git
-pi install git:github.com/leench/pi-model-proxy
+pi install git:github.com/leench/pi-proxy-router
 ```
 
 ## 配置

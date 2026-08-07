@@ -1,4 +1,4 @@
-# pi-model-proxy
+# pi-proxy-router
 
 Per-model proxy routing extension for the [Pi](https://github.com/earendil-works/pi) coding agent. Route each model through its own proxy (SOCKS5 / HTTP) with per-session toggles — no provider config changes required.
 
@@ -18,22 +18,22 @@ Per-model proxy routing extension for the [Pi](https://github.com/earendil-works
 
 ```bash
 # Global install (~/.pi/agent/extensions/)
-mkdir -p ~/.pi/agent/extensions/pi-model-proxy
-cd ~/.pi/agent/extensions/pi-model-proxy
+mkdir -p ~/.pi/agent/extensions/pi-proxy-router
+cd ~/.pi/agent/extensions/pi-proxy-router
 # copy this package's files (index.ts, socks-dispatcher.ts, package.json) here
 npm install
 ```
 
 Then run `/reload` in pi, or restart — you should see `[model-proxy] loaded` in the startup log.
 
-> Project-local install: put it in `.pi/extensions/pi-model-proxy/` (requires trusting the project first).
+> Project-local install: put it in `.pi/extensions/pi-proxy-router/` (requires trusting the project first).
 
 Or install as a pi package:
 
 ```bash
-pi install npm:pi-model-proxy
+pi install npm:pi-proxy-router
 # or from git
-pi install git:github.com/leench/pi-model-proxy
+pi install git:github.com/leench/pi-proxy-router
 ```
 
 ## Configuration

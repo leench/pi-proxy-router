@@ -26,7 +26,7 @@ const logError = (...args: unknown[]) => {
 };
 
 /**
- * pi-model-proxy：按模型路由代理。
+ * pi-proxy-router：按模型路由代理。
  *
  * 配置在 settings.json 的 "model-proxy" 节点（全局 ~/.pi/agent/settings.json
  * 与项目 .pi/settings.json，项目覆盖全局）：
