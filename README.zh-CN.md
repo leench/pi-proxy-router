@@ -6,7 +6,7 @@
 
 - **按模型规则路由**：`provider/模型模式` 匹配（`*` 通配），每个模型可独立指定代理或直连
 - **多协议支持**：`socks5h://`、`http://`、`https://` 代理，或 `direct` 显式直连
-- **配置即改即生效**：读取 `settings.json` 的 `model-proxy` 节点，修改文件后自动重载（mtime 检测）
+- **配置即改即生效**：读取 `settings.json` 的 `proxy-router` 节点（旧键名 `model-proxy` 仍兼容），修改文件后自动重载（mtime 检测）
 - **启动开关**：`pi --noproxy` 禁用全部代理规则
 - **会话内命令**：
   - `/allproxy <url>` — 全局强制代理（临时，不写配置）
@@ -38,11 +38,11 @@ pi install git:github.com/leench/pi-proxy-router
 
 ## 配置
 
-在 `settings.json`（全局 `~/.pi/agent/settings.json` 或项目 `.pi/settings.json`，项目覆盖全局）中添加 `model-proxy` 节点：
+在 `settings.json`（全局 `~/.pi/agent/settings.json` 或项目 `.pi/settings.json`，项目覆盖全局）中添加 `proxy-router` 节点（旧键名 `model-proxy` 仍会被兼容读取）：
 
 ```json
 {
-  "model-proxy": {
+  "proxy-router": {
     "openai-codex/*":       "socks5h://127.0.0.1:7890",
     "openai/*":             "socks5h://127.0.0.1:7890",
     "opencode-go/gpt*":     "socks5h://192.168.1.100:7890",

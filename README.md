@@ -1,12 +1,14 @@
 # pi-proxy-router
 
+[中文说明 (Chinese README)](README.zh-CN.md)
+
 Per-model proxy routing extension for the [Pi](https://github.com/earendil-works/pi) coding agent. Route each model through its own proxy (SOCKS5 / HTTP) with per-session toggles — no provider config changes required.
 
 ## Features
 
 - **Per-model rules**: match `provider/model` patterns (`*` wildcard), each model gets its own proxy or direct connection
 - **Multiple protocols**: `socks5h://`, `http://`, `https://` proxies, or `direct` to force a direct connection
-- **Hot-reload config**: rules are read from the `model-proxy` key in `settings.json`; editing the file reloads them automatically (mtime-based)
+- **Hot-reload config**: rules are read from the `proxy-router` key in `settings.json` (legacy `model-proxy` key still supported); editing the file reloads them automatically (mtime-based)
 - **Startup flag**: `pi --noproxy` disables all proxy rules
 - **Session commands**:
   - `/allproxy <url>` — force ALL models through one proxy (session-only, nothing persisted)
@@ -38,11 +40,11 @@ pi install git:github.com/leench/pi-proxy-router
 
 ## Configuration
 
-Add a `model-proxy` key to `settings.json` (global `~/.pi/agent/settings.json` or project `.pi/settings.json`; project overrides global):
+Add a `proxy-router` key to `settings.json` (global `~/.pi/agent/settings.json` or project `.pi/settings.json`; project overrides global). The old `model-proxy` key name is still read as a fallback:
 
 ```json
 {
-  "model-proxy": {
+  "proxy-router": {
     "openai-codex/*":       "socks5h://127.0.0.1:7890",
     "openai/*":             "socks5h://127.0.0.1:7890",
     "opencode-go/gpt*":     "socks5h://192.168.1.100:7890",

@@ -28,10 +28,10 @@ const logError = (...args: unknown[]) => {
 /**
  * pi-proxy-router：按模型路由代理。
  *
- * 配置在 settings.json 的 "model-proxy" 节点（全局 ~/.pi/agent/settings.json
- * 与项目 .pi/settings.json，项目覆盖全局）：
+ * 配置在 settings.json 的 "proxy-router" 节点（全局 ~/.pi/agent/settings.json
+ * 与项目 .pi/settings.json，项目覆盖全局；旧键名 "model-proxy" 仍兼容）：
  *
- *   "model-proxy": {
+ *   "proxy-router": {
  *     "openai/*":            "socks5h://localhost:7890",
  *     "opencode-go/gpt*":    "socks5h://192.168.1.100:7890",
  *     "opencode-go/glm*":    "direct"     // 显式直连
@@ -92,7 +92,9 @@ function loadRules(): ProxyRule[] {
     try {
       if (!existsSync(file)) continue;
       const settings = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
-      const node = settings["model-proxy"];
+      const node = (settings["proxy-router"] ?? settings["model-proxy"]) as
+        | Record<string, unknown>
+        | undefined;
       if (!node || typeof node !== "object") continue;
       for (const [pattern, value] of Object.entries(node as Record<string, unknown>)) {
         merged[pattern] =
