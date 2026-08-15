@@ -145,6 +145,11 @@ export default function (pi: ExtensionAPI) {
     default: false,
   });
 
+  // Provider callbacks can outlive this extension activation across /reload or
+  // session replacement. Snapshot the immutable CLI flag here so those
+  // callbacks never call methods on the old ExtensionAPI instance later.
+  const noproxyFlag = Boolean(pi.getFlag("noproxy"));
+
   pi.registerCommand("proxy", {
     description:
       "Show current proxy routing status: /proxy [provider/model] — optional arg resolves that model",
@@ -152,7 +157,7 @@ export default function (pi: ExtensionAPI) {
       const target = args.trim();
       const lines: string[] = [];
       lines.push("[proxy-router] status");
-      lines.push(`  --noproxy flag:  ${pi.getFlag("noproxy") ? "on (disabled)" : "off"}`);
+      lines.push(`  --noproxy flag:  ${noproxyFlag ? "on (disabled)" : "off"}`);
       lines.push(`  /noproxy:        ${commandDisabled ? "off (direct)" : "on (rules active)"}`);
       lines.push(`  /allproxy:       ${allProxyUrl ?? "not set"}`);
       // 环境变量中的代理设置（影响 pi 的 EnvHttpProxyAgent 默认链路）
@@ -177,7 +182,7 @@ export default function (pi: ExtensionAPI) {
           const provider = target.slice(0, slash);
           const model = target.slice(slash + 1);
           lines.push(
-            `  resolve ${target} -> ${resolveProxyUrl(pi, provider, model) ?? "direct"}`,
+            `  resolve ${target} -> ${resolveProxyUrl(noproxyFlag, provider, model) ?? "direct"}`,
           );
         } else {
           lines.push(`  (usage: /proxy [provider/model] e.g. openai-codex/gpt-5.6-luna)`);
@@ -245,7 +250,7 @@ export default function (pi: ExtensionAPI) {
       context: Context,
       options?: SimpleStreamOptions,
     ): AssistantMessageEventStream => {
-      const proxyUrl = resolveProxyUrl(pi, model.provider, model.id);
+      const proxyUrl = resolveProxyUrl(noproxyFlag, model.provider, model.id);
       log(
         `route: ${model.provider}/${model.id} -> ${proxyUrl ?? "direct"}`,
       );
@@ -299,11 +304,11 @@ export default function (pi: ExtensionAPI) {
 }
 
 function resolveProxyUrl(
-  pi: ExtensionAPI,
+  noproxyFlag: boolean,
   provider: string,
   modelId: string,
 ): string | null {
-  if (commandDisabled || pi.getFlag("noproxy")) {
+  if (commandDisabled || noproxyFlag) {
     return null;
   }
   // /allproxy 全局代理优先于规则
