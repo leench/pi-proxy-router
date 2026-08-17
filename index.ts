@@ -9,7 +9,13 @@ import type {
   SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import * as piAi from "@earendil-works/pi-ai";
-import { fetch as undiciFetch, ProxyAgent } from "undici";
+import {
+  fetch as undiciFetch,
+  getGlobalDispatcher,
+  ProxyAgent,
+  setGlobalDispatcher,
+  type Dispatcher,
+} from "undici";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -33,7 +39,7 @@ const logError = (...args: unknown[]) => {
  *
  *   "proxy-router": {
  *     "openai/*":            "socks5h://localhost:7890",
- *     "opencode-go/gpt*":    "socks5h://192.168.1.100:7890",
+ *     "opencode-go/gpt*":    "socks5h://proxy.example.test:7890",
  *     "opencode-go/glm*":    "direct"     // 显式直连
  *   }
  *
@@ -48,7 +54,7 @@ const logError = (...args: unknown[]) => {
  * 限制：streamSimple 钩子只接管 api=openai-responses 的模型（opencode-go
  * 的 gpt-5.6-luna/grok-4.5、openai 的 gpt-*）；opencode-go 的
  * openai-completions（deepseek/glm）与 anthropic-messages（qwen/minimax）
- * 模型不受影响，始终按默认行为直连。
+ * 模型不经过模型级 hook；启用 /allproxy 时仍由临时进程级 dispatcher 统一代理。
  */
 
 // ── settings.json 规则加载（mtime 缓存，改文件后自动重载）─────────────
@@ -138,9 +144,69 @@ function getDispatcher(proxyUrl: string): unknown | null {
 let commandDisabled = false; // /noproxy 禁用所有代理
 let allProxyUrl: string | null = null; // /allproxy 全局代理（最高优先级，临时）
 
+interface GlobalDispatcherState {
+  managedUrl: string | undefined;
+  previous: Dispatcher | undefined;
+  applied: Dispatcher | undefined;
+}
+
+const globalDispatcherState: GlobalDispatcherState = {
+  managedUrl: undefined,
+  previous: undefined,
+  applied: undefined,
+};
+
+function effectiveAllProxyUrl(noproxyFlag: boolean): string | null {
+  if (noproxyFlag || commandDisabled) return null;
+  return allProxyUrl;
+}
+
+/**
+ * Install the temporary /allproxy URL as Pi's process-wide Undici dispatcher.
+ * This intentionally applies only while /allproxy is active; ordinary model
+ * routing remains scoped to the matching provider/model rule.
+ */
+function applyAllProxy(noproxyFlag: boolean): void {
+  const desired = effectiveAllProxyUrl(noproxyFlag);
+
+  const current = getGlobalDispatcher();
+  if (desired === null) {
+    if (globalDispatcherState.managedUrl === undefined) return;
+    const restore =
+      current === globalDispatcherState.applied
+        ? (globalDispatcherState.previous ?? current)
+        : current;
+    setGlobalDispatcher(restore);
+    globalDispatcherState.managedUrl = undefined;
+    globalDispatcherState.previous = undefined;
+    globalDispatcherState.applied = undefined;
+    log("/allproxy -> off (restore Pi dispatcher)");
+    return;
+  }
+
+  const dispatcher = getDispatcher(desired) as Dispatcher | null;
+  if (!dispatcher) {
+    logError(`unsupported /allproxy URL, keeping current dispatcher: ${desired}`);
+    return;
+  }
+
+  if (globalDispatcherState.managedUrl === undefined) {
+    globalDispatcherState.previous = current;
+  } else if (current !== globalDispatcherState.applied) {
+    // Pi may recreate its EnvHttpProxyAgent when runtime settings change.
+    // Preserve that fresh dispatcher as the restore target.
+    globalDispatcherState.previous = current;
+  }
+
+  if (current !== dispatcher) setGlobalDispatcher(dispatcher);
+  globalDispatcherState.managedUrl = desired;
+  globalDispatcherState.applied = dispatcher;
+  log(`/allproxy dispatcher -> ${desired}`);
+}
+
 export default function (pi: ExtensionAPI) {
   pi.registerFlag("noproxy", {
-    description: "Disable proxy routing (all model requests go direct)",
+    description: "Disable proxy routing (models and temporary /allproxy requests go direct)",
     type: "boolean",
     default: false,
   });
@@ -201,6 +267,7 @@ export default function (pi: ExtensionAPI) {
       if (arg === "on") commandDisabled = false;
       else if (arg === "off") commandDisabled = true;
       else commandDisabled = !commandDisabled;
+      applyAllProxy(noproxyFlag);
       const state = commandDisabled ? "off (direct)" : "on (rules active)";
       log(`/noproxy -> ${state}`);
       ctx.ui.notify(`proxy-router: ${state}`, "info");
@@ -209,13 +276,14 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("allproxy", {
     description:
-      "Force ALL models through a proxy (session-only, not persisted): /allproxy [url] — no arg to cancel",
+      "Force Pi HTTP(S) and all models through a proxy (session-only, not persisted): /allproxy [url] — no arg to cancel",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const url = args.trim();
       if (!url) {
         allProxyUrl = null;
+        applyAllProxy(noproxyFlag);
         log("/allproxy -> off (rules active)");
-        ctx.ui.notify("proxy-router: global proxy off", "info");
+        ctx.ui.notify("proxy-router: /allproxy off", "info");
         return;
       }
       if (!/^(https?|socks5h?):\/\//i.test(url)) {
@@ -223,6 +291,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       allProxyUrl = url;
+      applyAllProxy(noproxyFlag);
       log(`/allproxy -> ${url} (all models)`);
       ctx.ui.notify(`proxy-router: all models -> ${url}`, "info");
     },
@@ -251,13 +320,16 @@ export default function (pi: ExtensionAPI) {
       options?: SimpleStreamOptions,
     ): AssistantMessageEventStream => {
       const proxyUrl = resolveProxyUrl(noproxyFlag, model.provider, model.id);
+      const forceCodexSse =
+        model.provider === "openai-codex" &&
+        Boolean(proxyUrl);
       log(
         `route: ${model.provider}/${model.id} -> ${proxyUrl ?? "direct"}`,
       );
       if (proxyUrl) {
         const dispatcher = getDispatcher(proxyUrl);
         if (dispatcher) {
-          return api.streamSimple(model, context, {
+          const routedOptions: SimpleStreamOptions = {
             ...options,
             fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
               try {
@@ -270,11 +342,19 @@ export default function (pi: ExtensionAPI) {
                 throw err;
               }
             }) as never,
-          });
+          };
+          if (forceCodexSse) routedOptions.transport = "sse";
+          return api.streamSimple(model, context, routedOptions);
         }
         logError(
           `unsupported proxy URL, going direct: ${proxyUrl}`,
         );
+      }
+      if (forceCodexSse) {
+        return api.streamSimple(model, context, {
+          ...options,
+          transport: "sse",
+        });
       }
       return api.streamSimple(model, context, options);
     };
@@ -296,6 +376,10 @@ export default function (pi: ExtensionAPI) {
     streamSimple: routeCodexResponses,
   });
 
+  // Pi may recreate its default dispatcher while runtime settings change.
+  // Reapply the temporary /allproxy dispatcher before a model turn when set.
+  pi.on("before_agent_start", () => applyAllProxy(noproxyFlag));
+
   const ruleCount = loadRules().length;
   log(
     `loaded (${ruleCount} rules from settings.json). ` +
@@ -311,7 +395,7 @@ function resolveProxyUrl(
   if (commandDisabled || noproxyFlag) {
     return null;
   }
-  // /allproxy 全局代理优先于规则
+  // /allproxy 临时全局代理优先于模型规则
   if (allProxyUrl) {
     return allProxyUrl;
   }

@@ -9,7 +9,7 @@
 - **配置即改即生效**：读取 `settings.json` 的 `proxy-router` 节点（旧键名 `model-proxy` 仍兼容），修改文件后自动重载（mtime 检测）
 - **启动开关**：`pi --noproxy` 禁用全部代理规则
 - **会话内命令**：
-  - `/allproxy <url>` — 全局强制代理（临时，不写配置）
+  - `/allproxy <url>` — Pi 的 HTTP(S) 流量及全部模型强制走一个代理（临时，不写配置）
   - `/noproxy [on|off]` — 禁用/恢复规则
   - `/proxy [provider/model]` — 查看当前代理状态（含环境变量）
 - **主/子 agent 通用**：子 agent 与主 agent 共享请求链路，规则自动生效
@@ -32,8 +32,6 @@ npm install
 
 ```bash
 pi install npm:pi-proxy-router
-# 或通过 git
-pi install git:github.com/leench/pi-proxy-router
 ```
 
 ## 配置
@@ -45,7 +43,7 @@ pi install git:github.com/leench/pi-proxy-router
   "proxy-router": {
     "openai-codex/*":       "socks5h://127.0.0.1:7890",
     "openai/*":             "socks5h://127.0.0.1:7890",
-    "opencode-go/gpt*":     "socks5h://192.168.1.100:7890",
+    "opencode-go/gpt*":     "socks5h://proxy.example.test:7890",
     "opencode-go/deepseek*": "direct",
     "opencode-go/glm*":     "direct"
   }
@@ -63,7 +61,7 @@ pi install git:github.com/leench/pi-proxy-router
 ### 优先级
 
 ```
---noproxy / /noproxy（禁用） > /allproxy（全局代理） > settings 规则 > 默认直连
+--noproxy / /noproxy（禁用） > /allproxy（临时进程代理） > 模型 settings 规则 > 默认直连
 ```
 
 ## 命令
@@ -72,8 +70,8 @@ pi install git:github.com/leench/pi-proxy-router
 |---|---|
 | `/proxy` | 查看当前状态：flag、开关、allproxy、环境变量、规则列表 |
 | `/proxy openai-codex/gpt-5.6-luna` | 附带参数时额外显示该模型的实际解析结果 |
-| `/allproxy http://127.0.0.1:7890` | 全部模型强制走该代理（会话级临时，不写配置） |
-| `/allproxy` | 取消全局代理，恢复规则 |
+| `/allproxy http://127.0.0.1:7890` | Pi 的 HTTP(S) 流量、OAuth 刷新及全部模型强制走该代理（会话级临时，不写配置） |
+| `/allproxy` | 取消临时代理，恢复规则 |
 | `/noproxy` | 切换禁用/恢复（不带参数时 toggle） |
 | `/noproxy on` / `/noproxy off` | 显式设置 |
 | `pi --noproxy` | 启动时禁用全部代理规则 |
@@ -84,6 +82,8 @@ pi 的 provider-composer 允许扩展通过 `pi.registerProvider(name, { api, st
 
 - `http://` / `https://` → undici `ProxyAgent`
 - `socks5h://` → 内置 `SocksDispatcher`（基于 `socks-proxy-agent` 实现 undici Dispatcher 接口，转发为 node http/https.request）
+
+启用 `/allproxy` 后，扩展会通过 Undici 的 `setGlobalDispatcher()` 临时安装该代理，因此 Pi 默认的 HTTP(S) 请求（包括 OAuth 刷新）和全部模型请求都会走它。该设置不写入 `settings.json`，取消 `/allproxy` 后恢复。Codex 模型启用代理时会固定使用 SSE，因为默认 WebSocket 链路不能使用注入的 fetch dispatcher。
 
 ```typescript
 pi.registerProvider("openai-codex", {
@@ -100,7 +100,8 @@ pi.registerProvider("openai-codex", {
 pi 启动时全局安装 `EnvHttpProxyAgent`（undici），所有 fetch 默认读取 `HTTP_PROXY` / `HTTPS_PROXY` 环境变量。因此：
 
 - 被扩展接管的模型走显式 dispatcher（规则优先，不受环境变量影响）
-- **不被接管的模型**（见下方限制）走默认链路 —— 设置了代理环境变量时它们也会走 HTTP 代理
+- 执行 `/allproxy` 后，Pi 的默认 HTTP(S) 链路（包括 OAuth）也走选定的 dispatcher
+- **不被接管的模型**（见下方限制）走默认链路——设置了代理环境变量时它们会走 HTTP 代理
 
 ## 已知限制
 
@@ -109,6 +110,7 @@ pi 启动时全局安装 `EnvHttpProxyAgent`（undici），所有 fetch 默认�
   - `openai-codex` → `openai-codex-responses`（gpt-5.6-luna 等）
   - 不接管 `openai-completions`（opencode-go/deepseek-*、glm-*）与 `anthropic-messages`（qwen、minimax）—— 这些模型走 pi 默认链路（直连，或随 `HTTP_PROXY` 环境变量走代理）
 - 若要覆盖这些 api，需要再扩展对应 api 的注册（欢迎 PR）
+- `/allproxy` 只在启用期间覆盖 Pi 进程内的 HTTP(S) 流量，不包括浏览器导航、任意子进程自己的网络请求、无关的原生 WebSocket 客户端，以及扩展加载前处理的独立 `pi auth ...` 命令。
 
 ## License
 
