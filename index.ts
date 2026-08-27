@@ -10,6 +10,7 @@ import type {
 } from "@earendil-works/pi-ai";
 import * as piAi from "@earendil-works/pi-ai";
 import {
+  Agent,
   fetch as undiciFetch,
   getGlobalDispatcher,
   ProxyAgent,
@@ -31,24 +32,43 @@ const logError = (...args: unknown[]) => {
   if (DEBUG) console.error("[proxy-router]", ...args);
 };
 
+function displayProxyUrl(proxyUrl: string | null): string {
+  if (proxyUrl === null) return "direct";
+  try {
+    const url = new URL(proxyUrl);
+    return `${url.protocol}//${url.host}`;
+  } catch {
+    return "[invalid proxy URL]";
+  }
+}
+
+function displayEnvValue(name: string, value: string): string {
+  if (!value) return "(not set)";
+  if (name === "NO_PROXY") return "(set)";
+  return displayProxyUrl(value);
+}
+
 /**
  * pi-proxy-router：按模型路由代理。
  *
- * 配置在 settings.json 的 "proxy-router" 节点（全局 ~/.pi/agent/settings.json
- * 与项目 .pi/settings.json，项目覆盖全局；旧键名 "model-proxy" 仍兼容）：
+ * 配置在独立的 proxy-router.json（全局 ~/.pi/agent/proxy-router.json 与项目
+ * .pi/proxy-router.json，项目覆盖全局）；settings.json 中的旧配置仍兼容：
  *
  *   "proxy-router": {
- *     "openai/*":            "socks5h://localhost:7890",
- *     "opencode-go/gpt*":    "socks5h://proxy.example.test:7890",
- *     "opencode-go/glm*":    "direct"     // 显式直连
+ *     "models": {
+ *       "openai-codex/*":  "socks5h://localhost:7890",
+ *       "opencode-go/gpt*": "socks5h://proxy.example.test:7890"
+ *     },
+ *     "auth": {
+ *       "openai-codex": "socks5h://localhost:7890"
+ *     }
  *   }
  *
- * - key 为 "provider/模型模式"，* 通配（provider 用实际 id，如 opencode-go）
- * - value 为代理 URL（http://、https://、socks5h://，按书写顺序首个命中）
- *   或 "direct"（直连）；不在列表中的模型默认直连。规范写法：socks5h://
- *   （远端解析）；兼容旧写法 socks5://（自动归一化为 socks5h 语义）
+ * - models 的 key 为 "provider/模型模式"，* 通配（provider 用实际 id，如 opencode-go）
+ * - auth 按 provider 配置会话内 OAuth 登录、token exchange 和 refresh 的代理
+ * - value 为代理 URL（http://、https://、socks5h://）或 "direct"（直连）
  * - 优先级：--noproxy / /noproxy（禁用）> /allproxy（全局代理，临时）
- *   > settings 规则 > 默认直连
+ *   > 独立配置规则 > settings 兼容规则 > Pi 默认链路
  * - 主 agent 与子 agent 共用同一请求链路，规则自动对两者生效
  *
  * 限制：streamSimple 钩子只接管 api=openai-responses 的模型（opencode-go
@@ -57,7 +77,7 @@ const logError = (...args: unknown[]) => {
  * 模型不经过模型级 hook；启用 /allproxy 时仍由临时进程级 dispatcher 统一代理。
  */
 
-// ── settings.json 规则加载（mtime 缓存，改文件后自动重载）─────────────
+// ── 配置加载（mtime 缓存，改文件后自动重载）────────────────────────────
 
 interface ProxyRule {
   pattern: string;
@@ -65,12 +85,29 @@ interface ProxyRule {
   regex: RegExp;
 }
 
-const SETTINGS_FILES = [
-  join(homedir(), ".pi", "agent", "settings.json"),
-  join(process.cwd(), ".pi", "settings.json"),
+interface AuthRule {
+  provider: string;
+  url: string | null; // null = 显式直连
+}
+
+interface RouteDecision {
+  matched: boolean;
+  url: string | null;
+}
+
+interface LoadedRules {
+  modelRules: ProxyRule[];
+  authRules: AuthRule[];
+}
+
+const RULE_SOURCES = [
+  { path: join(homedir(), ".pi", "agent", "settings.json"), dedicated: false },
+  { path: join(process.cwd(), ".pi", "settings.json"), dedicated: false },
+  { path: join(homedir(), ".pi", "agent", "proxy-router.json"), dedicated: true },
+  { path: join(process.cwd(), ".pi", "proxy-router.json"), dedicated: true },
 ];
 
-let rulesCache: { rules: ProxyRule[]; mtimes: number[] } | null = null;
+let rulesCache: (LoadedRules & { mtimes: number[] }) | null = null;
 
 function globToRegExp(pattern: string): RegExp {
   let re = "";
@@ -82,56 +119,72 @@ function globToRegExp(pattern: string): RegExp {
   return new RegExp(`^${re}$`);
 }
 
-function loadRules(): ProxyRule[] {
-  const mtimes = SETTINGS_FILES.map((f) => {
+function loadRules(): LoadedRules {
+  const mtimes = RULE_SOURCES.map(({ path }) => {
     try {
-      return statSync(f).mtimeMs;
+      return statSync(path).mtimeMs;
     } catch {
       return 0;
     }
   });
   if (rulesCache && mtimes.every((m, i) => m === rulesCache!.mtimes[i])) {
-    return rulesCache.rules;
+    return rulesCache;
   }
-  const merged: Record<string, string | null> = {};
-  for (const file of SETTINGS_FILES) {
+  const mergedModels: Record<string, string | null> = {};
+  const mergedAuth: Record<string, string | null> = {};
+  for (const source of RULE_SOURCES) {
     try {
-      if (!existsSync(file)) continue;
-      const settings = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
-      const node = (settings["proxy-router"] ?? settings["model-proxy"]) as
+      if (!existsSync(source.path)) continue;
+      const settings = JSON.parse(readFileSync(source.path, "utf8")) as Record<string, unknown>;
+      const node = (source.dedicated
+        ? (settings["proxy-router"] ?? settings)
+        : (settings["proxy-router"] ?? settings["model-proxy"])) as
         | Record<string, unknown>
         | undefined;
       if (!node || typeof node !== "object") continue;
-      for (const [pattern, value] of Object.entries(node as Record<string, unknown>)) {
-        merged[pattern] =
-          typeof value === "string" && value.trim() && !/^direct$/i.test(value)
-            ? value.trim()
-            : null;
+      const modelNode =
+        node.models && typeof node.models === "object" && !Array.isArray(node.models)
+          ? (node.models as Record<string, unknown>)
+          : node;
+      for (const [pattern, value] of Object.entries(modelNode)) {
+        if (typeof value !== "string") continue;
+        const trimmed = value.trim();
+        mergedModels[pattern] = trimmed && !/^direct$/i.test(trimmed) ? trimmed : null;
+      }
+      const authNode = node.auth;
+      if (authNode && typeof authNode === "object" && !Array.isArray(authNode)) {
+        for (const [provider, value] of Object.entries(authNode as Record<string, unknown>)) {
+          if (typeof value !== "string") continue;
+          const trimmed = value.trim();
+          mergedAuth[provider] = trimmed && !/^direct$/i.test(trimmed) ? trimmed : null;
+        }
       }
     } catch (err) {
-      logError("settings.json parse error:", err);
+      logError(`config parse error (${source.path}):`, err);
     }
   }
-  const rules = Object.entries(merged).map(([pattern, url]) => ({
+  const modelRules = Object.entries(mergedModels).map(([pattern, url]) => ({
     pattern,
     url,
     regex: globToRegExp(pattern),
   }));
-  rulesCache = { rules, mtimes };
-  return rules;
+  const authRules = Object.entries(mergedAuth).map(([provider, url]) => ({ provider, url }));
+  rulesCache = { modelRules, authRules, mtimes };
+  return rulesCache;
 }
 
 // ── 代理 dispatcher 缓存 ─────────────────────────────────────────────
 
-const dispatcherCache = new Map<string, unknown>();
+const dispatcherCache = new Map<string, Dispatcher>();
+let directDispatcher: Dispatcher | undefined;
 
-function getDispatcher(proxyUrl: string): unknown | null {
+function getDispatcher(proxyUrl: string): Dispatcher | null {
   let dispatcher = dispatcherCache.get(proxyUrl);
   if (!dispatcher) {
     if (/^https?:\/\//i.test(proxyUrl)) {
-      dispatcher = new ProxyAgent(proxyUrl);
+      dispatcher = new ProxyAgent(proxyUrl) as Dispatcher;
     } else if (/^socks5/i.test(proxyUrl)) {
-      dispatcher = new SocksDispatcher(proxyUrl);
+      dispatcher = new SocksDispatcher(proxyUrl) as unknown as Dispatcher;
     } else {
       return null; // 不支持的协议 → 直连
     }
@@ -140,68 +193,124 @@ function getDispatcher(proxyUrl: string): unknown | null {
   return dispatcher;
 }
 
+function getRouteDispatcher(proxyUrl: string | null): Dispatcher | null {
+  if (proxyUrl === null) {
+    directDispatcher ??= new Agent() as Dispatcher;
+    return directDispatcher;
+  }
+  return getDispatcher(proxyUrl);
+}
+
 // 运行时状态
 let commandDisabled = false; // /noproxy 禁用所有代理
 let allProxyUrl: string | null = null; // /allproxy 全局代理（最高优先级，临时）
 
-interface GlobalDispatcherState {
-  managedUrl: string | undefined;
-  previous: Dispatcher | undefined;
-  applied: Dispatcher | undefined;
-}
+// 仅支持 Pi 当前已知的认证 endpoint；不开放任意 URL 通配，避免演变成
+// GFWList。浏览器页面本身不会经过这里，只有 Pi 进程内的 token/device 请求会匹配。
+const AUTH_ENDPOINTS = [
+  {
+    provider: "openai-codex",
+    hostname: "auth.openai.com",
+    path: /^\/(?:oauth\/token|api\/accounts\/deviceauth\/(?:usercode|token))$/,
+  },
+];
 
-const globalDispatcherState: GlobalDispatcherState = {
-  managedUrl: undefined,
-  previous: undefined,
-  applied: undefined,
+type ManagedDispatcher = Dispatcher & {
+  __piProxyRouterGlobalDispatcher?: { fallback: Dispatcher };
 };
 
-function effectiveAllProxyUrl(noproxyFlag: boolean): string | null {
-  if (noproxyFlag || commandDisabled) return null;
-  return allProxyUrl;
+const globalDispatcherState: { applied: Dispatcher | undefined } = { applied: undefined };
+
+class GlobalRoutingDispatcher {
+  readonly __piProxyRouterGlobalDispatcher: { fallback: Dispatcher };
+  private readonly fallback: Dispatcher;
+  private readonly noproxyFlag: boolean;
+
+  constructor(fallback: Dispatcher, noproxyFlag: boolean) {
+    this.fallback = fallback;
+    this.noproxyFlag = noproxyFlag;
+    this.__piProxyRouterGlobalDispatcher = { fallback };
+  }
+
+  dispatch(options: any, handler: any): boolean {
+    const route = resolveGlobalRoute(this.noproxyFlag, options);
+    if (route.matched) {
+      const dispatcher = getRouteDispatcher(route.url);
+      if (dispatcher) return dispatcher.dispatch(options, handler);
+      logError(`unsupported global proxy URL, going direct: ${route.url}`);
+    }
+    return this.fallback.dispatch(options, handler);
+  }
+
+  close(): Promise<void> {
+    return this.fallback.close();
+  }
+
+  destroy(): Promise<void> {
+    return this.fallback.destroy();
+  }
 }
 
-/**
- * Install the temporary /allproxy URL as Pi's process-wide Undici dispatcher.
- * This intentionally applies only while /allproxy is active; ordinary model
- * routing remains scoped to the matching provider/model rule.
- */
-function applyAllProxy(noproxyFlag: boolean): void {
-  const desired = effectiveAllProxyUrl(noproxyFlag);
-
-  const current = getGlobalDispatcher();
-  if (desired === null) {
-    if (globalDispatcherState.managedUrl === undefined) return;
-    const restore =
-      current === globalDispatcherState.applied
-        ? (globalDispatcherState.previous ?? current)
-        : current;
-    setGlobalDispatcher(restore);
-    globalDispatcherState.managedUrl = undefined;
-    globalDispatcherState.previous = undefined;
-    globalDispatcherState.applied = undefined;
-    log("/allproxy -> off (restore Pi dispatcher)");
-    return;
+function unwrapManagedDispatcher(current: Dispatcher): Dispatcher {
+  let base = current;
+  const seen = new Set<Dispatcher>();
+  while (!seen.has(base)) {
+    seen.add(base);
+    const marker = (base as ManagedDispatcher).__piProxyRouterGlobalDispatcher;
+    if (!marker?.fallback) break;
+    base = marker.fallback;
   }
+  return base;
+}
 
-  const dispatcher = getDispatcher(desired) as Dispatcher | null;
-  if (!dispatcher) {
-    logError(`unsupported /allproxy URL, keeping current dispatcher: ${desired}`);
-    return;
-  }
-
-  if (globalDispatcherState.managedUrl === undefined) {
-    globalDispatcherState.previous = current;
-  } else if (current !== globalDispatcherState.applied) {
-    // Pi may recreate its EnvHttpProxyAgent when runtime settings change.
-    // Preserve that fresh dispatcher as the restore target.
-    globalDispatcherState.previous = current;
-  }
-
-  if (current !== dispatcher) setGlobalDispatcher(dispatcher);
-  globalDispatcherState.managedUrl = desired;
+function ensureGlobalDispatcher(noproxyFlag: boolean): void {
+  const current = getGlobalDispatcher() as Dispatcher;
+  if (current === globalDispatcherState.applied) return;
+  const dispatcher = new GlobalRoutingDispatcher(
+    unwrapManagedDispatcher(current),
+    noproxyFlag,
+  ) as unknown as Dispatcher;
+  setGlobalDispatcher(dispatcher);
   globalDispatcherState.applied = dispatcher;
-  log(`/allproxy dispatcher -> ${desired}`);
+  log("global auth dispatcher installed");
+}
+
+function applyAllProxy(noproxyFlag: boolean): void {
+  // The dispatcher stays installed for auth rules; /allproxy only changes the
+  // dynamic decision made by that dispatcher.
+  ensureGlobalDispatcher(noproxyFlag);
+}
+
+function getRequestUrl(options: any): URL | null {
+  try {
+    if (!options?.origin) return null;
+    return new URL(options.path || "/", String(options.origin));
+  } catch {
+    return null;
+  }
+}
+
+function resolveAuthProvider(url: URL): string | null {
+  const hostname = url.hostname.toLowerCase();
+  return (
+    AUTH_ENDPOINTS.find(
+      (endpoint) => endpoint.hostname === hostname && endpoint.path.test(url.pathname),
+    )?.provider ?? null
+  );
+}
+
+function resolveGlobalRoute(noproxyFlag: boolean, options: any): RouteDecision {
+  if (noproxyFlag || commandDisabled) return { matched: false, url: null };
+  if (allProxyUrl) return { matched: true, url: allProxyUrl };
+
+  const url = getRequestUrl(options);
+  if (!url) return { matched: false, url: null };
+  const provider = resolveAuthProvider(url);
+  if (!provider) return { matched: false, url: null };
+  const rule = loadRules().authRules.find((entry) => entry.provider === provider);
+  if (!rule) return { matched: false, url: null };
+  log(`auth route: ${provider}${url.pathname} -> ${displayProxyUrl(rule.url)}`);
+  return { matched: true, url: rule.url };
 }
 
 export default function (pi: ExtensionAPI) {
@@ -225,7 +334,7 @@ export default function (pi: ExtensionAPI) {
       lines.push("[proxy-router] status");
       lines.push(`  --noproxy flag:  ${noproxyFlag ? "on (disabled)" : "off"}`);
       lines.push(`  /noproxy:        ${commandDisabled ? "off (direct)" : "on (rules active)"}`);
-      lines.push(`  /allproxy:       ${allProxyUrl ?? "not set"}`);
+      lines.push(`  /allproxy:       ${allProxyUrl ? displayProxyUrl(allProxyUrl) : "not set"}`);
       // 环境变量中的代理设置（影响 pi 的 EnvHttpProxyAgent 默认链路）
       const envVars: [string, string][] = [
         ["HTTP_PROXY", process.env.HTTP_PROXY ?? ""],
@@ -235,12 +344,16 @@ export default function (pi: ExtensionAPI) {
       ];
       lines.push("  env:");
       for (const [name, value] of envVars) {
-        lines.push(`    ${name.padEnd(12)} ${value ? value : "(not set)"}`);
+        lines.push(`    ${name.padEnd(12)} ${displayEnvValue(name, value)}`);
       }
       const rules = loadRules();
-      lines.push(`  rules (${rules.length}):`);
-      for (const r of rules) {
-        lines.push(`    ${r.pattern.padEnd(24)} -> ${r.url ?? "direct"}`);
+      lines.push(`  model rules (${rules.modelRules.length}):`);
+      for (const r of rules.modelRules) {
+        lines.push(`    ${r.pattern.padEnd(24)} -> ${displayProxyUrl(r.url)}`);
+      }
+      lines.push(`  auth rules (${rules.authRules.length}):`);
+      for (const r of rules.authRules) {
+        lines.push(`    ${r.provider.padEnd(24)} -> ${displayProxyUrl(r.url)}`);
       }
       if (target) {
         const slash = target.indexOf("/");
@@ -248,7 +361,7 @@ export default function (pi: ExtensionAPI) {
           const provider = target.slice(0, slash);
           const model = target.slice(slash + 1);
           lines.push(
-            `  resolve ${target} -> ${resolveProxyUrl(noproxyFlag, provider, model) ?? "direct"}`,
+            `  resolve ${target} -> ${displayProxyUrl(resolveProxyUrl(noproxyFlag, provider, model))}`,
           );
         } else {
           lines.push(`  (usage: /proxy [provider/model] e.g. openai-codex/gpt-5.6-luna)`);
@@ -287,13 +400,13 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       if (!/^(https?|socks5h?):\/\//i.test(url)) {
-        ctx.ui.notify(`proxy-router: invalid proxy URL: ${url}`, "error");
+        ctx.ui.notify("proxy-router: invalid proxy URL", "error");
         return;
       }
       allProxyUrl = url;
       applyAllProxy(noproxyFlag);
-      log(`/allproxy -> ${url} (all models)`);
-      ctx.ui.notify(`proxy-router: all models -> ${url}`, "info");
+      log(`/allproxy -> ${displayProxyUrl(url)} (all models)`);
+      ctx.ui.notify(`proxy-router: all models -> ${displayProxyUrl(url)}`, "info");
     },
   });
 
@@ -319,15 +432,16 @@ export default function (pi: ExtensionAPI) {
       context: Context,
       options?: SimpleStreamOptions,
     ): AssistantMessageEventStream => {
-      const proxyUrl = resolveProxyUrl(noproxyFlag, model.provider, model.id);
+      const route = resolveModelRoute(noproxyFlag, model.provider, model.id);
+      const proxyUrl = route.matched ? route.url : null;
       const forceCodexSse =
         model.provider === "openai-codex" &&
         Boolean(proxyUrl);
       log(
-        `route: ${model.provider}/${model.id} -> ${proxyUrl ?? "direct"}`,
+        `route: ${model.provider}/${model.id} -> ${displayProxyUrl(proxyUrl)}`,
       );
-      if (proxyUrl) {
-        const dispatcher = getDispatcher(proxyUrl);
+      if (route.matched) {
+        const dispatcher = getRouteDispatcher(route.url);
         if (dispatcher) {
           const routedOptions: SimpleStreamOptions = {
             ...options,
@@ -346,9 +460,7 @@ export default function (pi: ExtensionAPI) {
           if (forceCodexSse) routedOptions.transport = "sse";
           return api.streamSimple(model, context, routedOptions);
         }
-        logError(
-          `unsupported proxy URL, going direct: ${proxyUrl}`,
-        );
+        logError(`unsupported proxy URL, going direct: ${displayProxyUrl(proxyUrl)}`);
       }
       if (forceCodexSse) {
         return api.streamSimple(model, context, {
@@ -377,14 +489,37 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Pi may recreate its default dispatcher while runtime settings change.
-  // Reapply the temporary /allproxy dispatcher before a model turn when set.
+  // Reinstall the auth-aware wrapper before a model turn when needed.
   pi.on("before_agent_start", () => applyAllProxy(noproxyFlag));
 
-  const ruleCount = loadRules().length;
+  ensureGlobalDispatcher(noproxyFlag);
+  const rules = loadRules();
   log(
-    `loaded (${ruleCount} rules from settings.json). ` +
+    `loaded (${rules.modelRules.length} model rules, ${rules.authRules.length} auth rules ` +
+      `from proxy-router config). ` +
       `--noproxy / /noproxy to disable.`,
   );
+}
+
+function resolveModelRoute(
+  noproxyFlag: boolean,
+  provider: string,
+  modelId: string,
+): RouteDecision {
+  if (commandDisabled || noproxyFlag) {
+    return { matched: false, url: null };
+  }
+  // /allproxy 临时全局代理优先于模型规则
+  if (allProxyUrl) {
+    return { matched: true, url: allProxyUrl };
+  }
+  const target = `${provider}/${modelId}`;
+  for (const rule of loadRules().modelRules) {
+    if (rule.regex.test(target)) {
+      return { matched: true, url: rule.url };
+    }
+  }
+  return { matched: false, url: null };
 }
 
 function resolveProxyUrl(
@@ -392,18 +527,6 @@ function resolveProxyUrl(
   provider: string,
   modelId: string,
 ): string | null {
-  if (commandDisabled || noproxyFlag) {
-    return null;
-  }
-  // /allproxy 临时全局代理优先于模型规则
-  if (allProxyUrl) {
-    return allProxyUrl;
-  }
-  const target = `${provider}/${modelId}`;
-  for (const rule of loadRules()) {
-    if (rule.regex.test(target)) {
-      return rule.url;
-    }
-  }
-  return null;
+  const route = resolveModelRoute(noproxyFlag, provider, modelId);
+  return route.matched ? route.url : null;
 }

@@ -93,13 +93,19 @@ export class SocksDispatcher {
     // 透传请求体（undici 内部 body 可能是 node 流或 web ReadableStream，
     // 跨 realm 时 instanceof 不可靠，按能力鸭子类型处理）
     const body = options.body as
+      | string
+      | Uint8Array
+      | ArrayBuffer
       | { pipe: (dest: NodeJS.WritableStream) => unknown }
       | AsyncIterable<Uint8Array>
       | null
       | undefined;
     if (body && typeof (body as { pipe?: unknown }).pipe === "function") {
       (body as { pipe: (dest: NodeJS.WritableStream) => unknown }).pipe(req);
-    } else if (body && typeof (body as AsyncIterable<Uint8Array>)[Symbol.asyncIterator] === "function") {
+    } else if (
+      body &&
+      typeof (body as AsyncIterable<Uint8Array>)[Symbol.asyncIterator] === "function"
+    ) {
       void (async () => {
         try {
           for await (const chunk of body as AsyncIterable<Uint8Array>) {
@@ -110,6 +116,10 @@ export class SocksDispatcher {
           req.destroy(e as Error);
         }
       })();
+    } else if (typeof body === "string" || body instanceof Uint8Array) {
+      req.end(body);
+    } else if (body instanceof ArrayBuffer) {
+      req.end(Buffer.from(body));
     } else {
       req.end();
     }

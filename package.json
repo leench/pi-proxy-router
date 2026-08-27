@@ -1,7 +1,7 @@
 {
   "name": "pi-proxy-router",
-  "version": "1.1.0",
-  "description": "Per-model proxy routing for pi: route each model through its own SOCKS5/HTTP proxy, with session commands (/proxy, /noproxy, /allproxy) and settings.json rules",
+  "version": "1.2.0",
+  "description": "Per-model and auth-flow proxy routing for pi with session commands (/proxy, /noproxy, /allproxy) and dedicated proxy-router.json rules",
   "keywords": [
     "pi-package",
     "pi-extension",
