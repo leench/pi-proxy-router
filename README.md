@@ -4,6 +4,8 @@
 
 Per-model and auth-flow proxy routing extension for the [Pi](https://github.com/earendil-works/pi) coding agent. Route each model and in-session OAuth flow through its own proxy (SOCKS5 / HTTP) with per-session toggles — no provider config changes required.
 
+See [CHANGELOG.md](CHANGELOG.md) for release compatibility and upgrade notes.
+
 ## Features
 
 - **Per-model rules**: match `provider/model` patterns (`*` wildcard), each model gets its own proxy or direct connection
@@ -36,6 +38,12 @@ Or install as a pi package:
 ```bash
 pi install npm:pi-proxy-router
 ```
+
+## Compatibility and upgrade
+
+- `1.2.1` supports the Undici 8 Dispatcher used by Pi 0.85.x while retaining compatibility with the Undici 7 Dispatcher.
+- If Pi exits with `handler.onHeaders is not a function`, update the extension and restart Pi; existing proxy configuration does not need to change.
+- This release only fixes Dispatcher callbacks and response-stream pause/resume handling. Model rules, auth rules, and session commands are unchanged.
 
 ## Configuration
 

@@ -28,6 +28,10 @@ function headersToArray(headers: Record<string, string | string[] | undefined>):
   return out;
 }
 
+function rawHeadersToBuffers(headers: string[]): Buffer[] {
+  return headers.map((value) => Buffer.from(value, "latin1"));
+}
+
 /**
  * 把 socks-proxy-agent（node http.Agent 风格）适配为 undici Dispatcher（dispatch()），
  * 使 undici fetch 可以走 SOCKS5 代理。
@@ -70,24 +74,113 @@ export class SocksDispatcher {
     } as never);
 
     const abort = () => req.destroy(new Error("The operation was aborted."));
-    handler.onConnect?.(abort);
+    const usesV2Handler = typeof handler.onRequestStart === "function";
+    const requestController = { abort };
+    let responseController:
+      | {
+          abort: (reason?: unknown) => void;
+          pause: () => void;
+          resume: () => void;
+          rawHeaders: Buffer[];
+        }
+      | undefined;
+    let completed = false;
+
+    const reportError = (error: unknown) => {
+      if (completed) return;
+      completed = true;
+      signal?.removeEventListener("abort", abort);
+      try {
+        if (usesV2Handler) {
+          handler.onResponseError?.(responseController ?? requestController, error);
+        } else {
+          handler.onError?.(error);
+        }
+      } catch {
+        // Handler errors must not escape a node event callback and crash pi.
+      }
+    };
+
+    req.on("error", reportError);
+
+    try {
+      if (usesV2Handler) {
+        handler.onRequestStart(requestController, null);
+      } else {
+        handler.onConnect?.(abort);
+      }
+    } catch (error) {
+      reportError(error);
+      req.destroy(error as Error);
+    }
+
     signal?.addEventListener("abort", abort, { once: true });
 
     req.on("response", (res) => {
-      handler.onResponseStarted?.();
-      handler.onHeaders(
-        res.statusCode ?? 0,
-        headersToArray(res.headers),
-        () => {},
-        res.statusMessage,
-      );
-      res.on("data", (chunk: Buffer) => handler.onData(chunk));
-      res.on("end", () => handler.onComplete([]));
-      res.on("error", (e) => handler.onError(e));
-    });
-    req.on("error", (e) => {
-      signal?.removeEventListener("abort", abort);
-      handler.onError(e);
+      let paused = false;
+      responseController = {
+        abort,
+        pause: () => {
+          paused = true;
+          res.pause();
+        },
+        resume: () => {
+          paused = false;
+          res.resume();
+        },
+        rawHeaders: rawHeadersToBuffers(res.rawHeaders),
+      };
+
+      try {
+        handler.onResponseStarted?.();
+        if (usesV2Handler) {
+          handler.onResponseStart(
+            responseController,
+            res.statusCode ?? 0,
+            res.headers,
+            res.statusMessage ?? "",
+          );
+        } else {
+          handler.onHeaders(
+            res.statusCode ?? 0,
+            headersToArray(res.headers),
+            () => res.resume(),
+            res.statusMessage,
+          );
+        }
+        if (paused) res.pause();
+      } catch (error) {
+        reportError(error);
+        res.destroy(error as Error);
+        return;
+      }
+
+      res.on("data", (chunk: Buffer) => {
+        try {
+          const shouldContinue = usesV2Handler
+            ? handler.onResponseData?.(responseController, chunk)
+            : handler.onData?.(chunk);
+          if (shouldContinue === false) res.pause();
+        } catch (error) {
+          reportError(error);
+          res.destroy(error as Error);
+        }
+      });
+      res.on("end", () => {
+        if (completed) return;
+        try {
+          if (usesV2Handler) {
+            handler.onResponseEnd(responseController, rawHeadersToBuffers(res.rawTrailers));
+          } else {
+            handler.onComplete?.([]);
+          }
+          completed = true;
+          signal?.removeEventListener("abort", abort);
+        } catch (error) {
+          reportError(error);
+        }
+      });
+      res.on("error", reportError);
     });
 
     // 透传请求体（undici 内部 body 可能是 node 流或 web ReadableStream，

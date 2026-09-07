@@ -1,6 +1,6 @@
 {
   "name": "pi-proxy-router",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Per-model and auth-flow proxy routing for pi with session commands (/proxy, /noproxy, /allproxy) and dedicated proxy-router.json rules",
   "keywords": [
     "pi-package",
@@ -21,7 +21,8 @@
     "socks-dispatcher.ts",
     "LICENSE",
     "README.md",
-    "README.zh-CN.md"
+    "README.zh-CN.md",
+    "CHANGELOG.md"
   ],
   "pi": {
     "extensions": [

@@ -2,6 +2,8 @@
 
 [Pi](https://github.com/earendil-works/pi) coding agent 的按模型和认证流程路由代理扩展。为不同模型、会话内 OAuth 认证配置代理策略（SOCKS5 / HTTP），支持会话级临时开关，无需修改任何 provider 配置。
 
+当前版本的[变更日志](CHANGELOG.md)记录了版本兼容性和升级说明。
+
 ## 特性
 
 - **按模型规则路由**：`provider/模型模式` 匹配（`*` 通配），每个模型可独立指定代理或直连
@@ -34,6 +36,12 @@ npm install
 ```bash
 pi install npm:pi-proxy-router
 ```
+
+## 兼容性与升级
+
+- `1.2.1` 兼容 Pi 0.85.x 使用的 Undici 8 Dispatcher，同时保留对 Undici 7 Dispatcher 的兼容。
+- 如果 Pi 出现 `handler.onHeaders is not a function` 并退出，更新扩展后重启 Pi；不需要修改现有代理配置。
+- 本次更新只修复 Dispatcher 回调和响应流的暂停/恢复处理，模型规则、认证规则和会话命令保持不变。
 
 ## 配置
 
