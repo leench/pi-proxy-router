@@ -17,7 +17,7 @@ See [CHANGELOG.md](CHANGELOG.md) for release compatibility and upgrade notes.
   - `/allproxy <url>` — force Pi HTTP(S) traffic and all models through one proxy (session-only, nothing persisted)
   - `/noproxy [on|off]` — disable/restore rules
   - `/proxy [provider/model]` — show current proxy status (including environment variables)
-- **Works for subagents**: child agents share the main agent's request pipeline, rules apply automatically
+- **Works for subagents**: background children may load this extension; foreground children still inherit the parent process's endpoint fallback even when ambient extensions are disabled
 
 ## Install
 
@@ -43,7 +43,7 @@ pi install npm:pi-proxy-router
 
 - `1.2.1` supports the Undici 8 Dispatcher used by Pi 0.85.x while retaining compatibility with the Undici 7 Dispatcher.
 - If Pi exits with `handler.onHeaders is not a function`, update the extension and restart Pi; existing proxy configuration does not need to change.
-- This release only fixes Dispatcher callbacks and response-stream pause/resume handling. Model rules, auth rules, and session commands are unchanged.
+- The unreleased routing changes also cover all model API types and foreground subagents; see `CHANGELOG.md` for details.
 
 ## Configuration
 
@@ -84,11 +84,14 @@ For migration, legacy global/project `settings.json` entries under `proxy-router
 
 ### In-session OAuth authentication
 
-`auth` rules currently cover these `openai-codex` endpoints:
+`auth` rules currently cover these built-in endpoints:
 
-- `auth.openai.com/oauth/token`
-- `auth.openai.com/api/accounts/deviceauth/usercode`
-- `auth.openai.com/api/accounts/deviceauth/token`
+- `openai-codex`: `auth.openai.com/oauth/token`, `auth.openai.com/api/accounts/deviceauth/usercode`, `auth.openai.com/api/accounts/deviceauth/token`
+- `anthropic`: `platform.claude.com/v1/oauth/token`
+- `github-copilot`: GitHub device/OAuth endpoints and `api.github.com` / `api.individual.githubcopilot.com` Copilot token endpoints
+- `kimi-coding`: `auth.kimi.com/api/oauth/device_authorization`, `auth.kimi.com/api/oauth/token`
+- `openrouter`: `openrouter.ai/api/v1/auth/keys`
+- `xai`: `auth.x.ai/oauth2/device/code`, `auth.x.ai/oauth2/token`
 
 Token exchange, refresh, and device-code requests from an in-session `/login` flow use the provider rule. Browser authorization pages are outside the extension, and the standalone `pi auth ...` command does not load extensions; use `HTTP_PROXY` / `HTTPS_PROXY` for that process.
 
@@ -106,25 +109,16 @@ Token exchange, refresh, and device-code requests from an in-session `/login` fl
 
 ## How it works
 
-Pi's provider-composer lets extensions override the streaming implementation for a provider on a **specific API type** via `pi.registerProvider(name, { api, streamSimple })`. This extension has two routing paths:
+This extension has three routing layers:
 
-- `models` resolves rules by model id inside the `streamSimple` hook and injects the transport layer with undici fetch + a custom dispatcher.
+- `models` wraps `stream` / `streamSimple` in the current session's model registry, resolves rules by model id for every API type, and injects undici fetch with a custom dispatcher.
+- The process-wide dispatcher also routes known model endpoints by their `baseUrl`, covering foreground children and HTTP APIs that bypass the provider wrapper.
 - `auth` installs a process-wide wrapper around Pi's default dispatcher. It selects a provider dispatcher only for known OAuth endpoints and delegates all other requests to Pi's original pipeline.
 
 - `http://` / `https://` → undici `ProxyAgent`
 - `socks5h://` → built-in `SocksDispatcher` (implements the undici Dispatcher interface over `socks-proxy-agent`, forwarded to node http/https.request)
 
-While `/allproxy` is active, the routing wrapper sends Pi's default HTTP(S) requests, including OAuth, and all model requests through the temporary proxy. It is not read from `settings.json` and is disabled when `/allproxy` is cancelled. Codex model requests are forced to SSE while proxied because the default WebSocket transport does not accept the injected fetch dispatcher.
-
-```typescript
-pi.registerProvider("openai-codex", {
-  api: "openai-codex-responses",
-  streamSimple: (model, context, options) => {
-    const proxy = resolveProxyUrl(false, model.provider, model.id);
-    // proxy matched → fetch with injected dispatcher; otherwise direct
-  },
-});
-```
+While `/allproxy` is active, the routing wrapper sends Pi's default HTTP(S) requests, including OAuth, and all model requests through the temporary proxy. It is not read from `settings.json` and is disabled when `/allproxy` is cancelled. Routed model requests use an explicit dispatcher instead of environment proxies. Codex requests are forced to SSE when proxied because the default WebSocket transport does not accept the injected fetch dispatcher; foreground children use the endpoint fallback and are forced from a routed WebSocket to SSE as well.
 
 ### URL matching (planned)
 
@@ -142,17 +136,14 @@ If needed later, this will be evaluated as an explicit `urls` section with separ
 
 Pi installs an `EnvHttpProxyAgent` globally at startup, so all fetch calls read `HTTP_PROXY` / `HTTPS_PROXY`. This means:
 
-- Models **intercepted** by this extension use the explicit dispatcher (rules win, environment not consulted)
+- Models matching a rule use the explicit dispatcher (rules win, environment not consulted)
+- Known model endpoints used by foreground children use the same rules
 - While `/allproxy` is active, Pi's default HTTP(S) pipeline (including OAuth) uses the selected dispatcher
-- Models **not intercepted** (see limits below) use the default pipeline — if proxy environment variables are set, they will go through the HTTP proxy
+- Models without a matching rule still use Pi's default pipeline; if proxy environment variables are set, they will go through the HTTP proxy
 
 ## Known limitations
 
-- **One API type per provider**: an extension can only register a hook for one `api` per provider. Currently intercepted:
-  - `opencode-go` / `openai` → `openai-responses` (gpt-* etc.)
-  - `openai-codex` → `openai-codex-responses` (gpt-5.6-luna etc.)
-  - NOT intercepted: `openai-completions` (opencode-go/deepseek-*, glm-*) and `anthropic-messages` (qwen, minimax) — those models use pi's default pipeline (direct, or via `HTTP_PROXY` if set)
-- To cover these API types, register hooks for them as well (PRs welcome)
+- The endpoint fallback relies on `baseUrl` from the current model registry. If different models share one base URL but have different proxy rules, URL-level routing cannot distinguish them; the first matching route is retained and a debug log is emitted. Use the same proxy rule for those models or separate endpoints.
 - `/allproxy` covers Pi's process HTTP(S) traffic only while it is active; it does not cover browser navigation, arbitrary child-process networking, unrelated native WebSocket clients, or the standalone `pi auth ...` command handled before extensions load.
 - `auth` only covers built-in provider auth endpoint mappings; adding a provider requires adding its endpoint mapping, not an arbitrary URL wildcard.
 

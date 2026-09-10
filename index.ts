@@ -3,12 +3,11 @@ import type {
   ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 import type {
-  AssistantMessageEventStream,
   Context,
   Model,
   SimpleStreamOptions,
+  StreamOptions,
 } from "@earendil-works/pi-ai";
-import * as piAi from "@earendil-works/pi-ai";
 import {
   Agent,
   fetch as undiciFetch,
@@ -69,12 +68,9 @@ function displayEnvValue(name: string, value: string): string {
  * - value 为代理 URL（http://、https://、socks5h://）或 "direct"（直连）
  * - 优先级：--noproxy / /noproxy（禁用）> /allproxy（全局代理，临时）
  *   > 独立配置规则 > settings 兼容规则 > Pi 默认链路
- * - 主 agent 与子 agent 共用同一请求链路，规则自动对两者生效
- *
- * 限制：streamSimple 钩子只接管 api=openai-responses 的模型（opencode-go
- * 的 gpt-5.6-luna/grok-4.5、openai 的 gpt-*）；opencode-go 的
- * openai-completions（deepseek/glm）与 anthropic-messages（qwen/minimax）
- * 模型不经过模型级 hook；启用 /allproxy 时仍由临时进程级 dispatcher 统一代理。
+ * - 后台子 agent 可直接加载本扩展；前台子 agent 不会重新加载 ambient
+ *   extensions，因此额外使用进程级 endpoint 路由兜底
+ * - 规则自动对主 agent 和子 agent 生效
  */
 
 // ── 配置加载（mtime 缓存，改文件后自动重载）────────────────────────────
@@ -178,7 +174,7 @@ function loadRules(): LoadedRules {
 const dispatcherCache = new Map<string, Dispatcher>();
 let directDispatcher: Dispatcher | undefined;
 
-function getDispatcher(proxyUrl: string): Dispatcher | null {
+function getDispatcher(proxyUrl: string): Dispatcher {
   let dispatcher = dispatcherCache.get(proxyUrl);
   if (!dispatcher) {
     if (/^https?:\/\//i.test(proxyUrl)) {
@@ -186,14 +182,14 @@ function getDispatcher(proxyUrl: string): Dispatcher | null {
     } else if (/^socks5/i.test(proxyUrl)) {
       dispatcher = new SocksDispatcher(proxyUrl) as unknown as Dispatcher;
     } else {
-      return null; // 不支持的协议 → 直连
+      throw new Error(`Unsupported proxy URL: ${proxyUrl}`);
     }
     dispatcherCache.set(proxyUrl, dispatcher);
   }
   return dispatcher;
 }
 
-function getRouteDispatcher(proxyUrl: string | null): Dispatcher | null {
+function getRouteDispatcher(proxyUrl: string | null): Dispatcher {
   if (proxyUrl === null) {
     directDispatcher ??= new Agent() as Dispatcher;
     return directDispatcher;
@@ -204,8 +200,9 @@ function getRouteDispatcher(proxyUrl: string | null): Dispatcher | null {
 // 运行时状态
 let commandDisabled = false; // /noproxy 禁用所有代理
 let allProxyUrl: string | null = null; // /allproxy 全局代理（最高优先级，临时）
+let activeNoproxyFlag = false;
 
-// 仅支持 Pi 当前已知的认证 endpoint；不开放任意 URL 通配，避免演变成
+// 只匹配 Pi 已知的认证 endpoint；不开放任意 URL 通配，避免演变成
 // GFWList。浏览器页面本身不会经过这里，只有 Pi 进程内的 token/device 请求会匹配。
 const AUTH_ENDPOINTS = [
   {
@@ -213,7 +210,106 @@ const AUTH_ENDPOINTS = [
     hostname: "auth.openai.com",
     path: /^\/(?:oauth\/token|api\/accounts\/deviceauth\/(?:usercode|token))$/,
   },
+  { provider: "anthropic", hostname: "platform.claude.com", path: /^\/v1\/oauth\/token$/ },
+  {
+    provider: "github-copilot",
+    hostname: "github.com",
+    path: /^\/login\/(?:device\/code|oauth\/access_token)$/,
+  },
+  {
+    provider: "github-copilot",
+    hostname: "api.github.com",
+    path: /^\/copilot_internal\/v2\/token$/,
+  },
+  {
+    provider: "github-copilot",
+    hostname: "api.individual.githubcopilot.com",
+    path: /^\/copilot_internal\/v2\/token$/,
+  },
+  { provider: "kimi-coding", hostname: "auth.kimi.com", path: /^\/api\/oauth\/(?:device_authorization|token)$/ },
+  { provider: "openrouter", hostname: "openrouter.ai", path: /^\/api\/v1\/auth\/keys$/ },
+  { provider: "xai", hostname: "auth.x.ai", path: /^\/oauth2\/(?:device\/code|token)$/ },
 ];
+
+type ModelEndpointRoute = {
+  base: URL;
+  basePath: string;
+  target: string;
+  route: RouteDecision;
+};
+
+// Foreground subagents run in the parent process without ambient extensions.
+// Keep a URL-level route table as a process-wide fallback for their model calls.
+let knownModels: readonly Model<any>[] = [];
+let modelEndpointRoutes: ModelEndpointRoute[] = [];
+let endpointRoutesRules: LoadedRules | null = null;
+
+function normalizeEndpointBase(raw: string): { base: URL; basePath: string } | null {
+  try {
+    const base = new URL(raw);
+    if (base.protocol !== "http:" && base.protocol !== "https:") return null;
+    const basePath = base.pathname.replace(/\/+$/, "") || "/";
+    base.pathname = basePath;
+    base.search = "";
+    base.hash = "";
+    return { base, basePath };
+  } catch {
+    return null;
+  }
+}
+
+function endpointMatches(url: URL, route: ModelEndpointRoute): boolean {
+  const protocol =
+    url.protocol === "ws:" ? "http:" : url.protocol === "wss:" ? "https:" : url.protocol;
+  if (protocol !== route.base.protocol || url.host !== route.base.host) return false;
+  if (route.basePath === "/") return true;
+  return url.pathname === route.basePath || url.pathname.startsWith(`${route.basePath}/`);
+}
+
+function rebuildModelEndpointRoutes(): void {
+  const byBase = new Map<string, ModelEndpointRoute>();
+  for (const model of knownModels) {
+    const route = resolveModelRoute(false, model.provider, model.id);
+    if (!route.matched) continue;
+    const normalized = normalizeEndpointBase(model.baseUrl);
+    if (!normalized) {
+      logError(`cannot route model with invalid base URL: ${model.provider}/${model.id}`);
+      continue;
+    }
+    const key = normalized.base.toString();
+    const target = `${model.provider}/${model.id}`;
+    const existing = byBase.get(key);
+    if (existing && existing.route.url !== route.url) {
+      // The URL alone cannot distinguish two models sharing an endpoint. Keep the
+      // first route, but make the ambiguity visible instead of silently falling back.
+      logError(`conflicting model rules share endpoint ${key}: ${existing.target}, ${target}`);
+    } else if (!existing) {
+      byBase.set(key, { ...normalized, target, route });
+    }
+  }
+  modelEndpointRoutes = [...byBase.values()].sort(
+    (a, b) => b.basePath.length - a.basePath.length,
+  );
+  endpointRoutesRules = loadRules();
+}
+
+function refreshModelEndpointRoutes(models: readonly Model<any>[]): void {
+  knownModels = [...models];
+  rebuildModelEndpointRoutes();
+}
+
+function ensureModelEndpointRoutesFresh(): void {
+  const rules = loadRules();
+  if (knownModels.length > 0 && endpointRoutesRules !== rules) rebuildModelEndpointRoutes();
+}
+
+function resolveModelEndpointRoute(url: URL): RouteDecision | null {
+  ensureModelEndpointRoutesFresh();
+  const matched = modelEndpointRoutes.find((entry) => endpointMatches(url, entry));
+  if (!matched) return null;
+  log(`model endpoint route: ${matched.target} ${url.pathname} -> ${displayProxyUrl(matched.route.url)}`);
+  return matched.route;
+}
 
 type ManagedDispatcher = Dispatcher & {
   __piProxyRouterGlobalDispatcher?: { fallback: Dispatcher };
@@ -224,20 +320,16 @@ const globalDispatcherState: { applied: Dispatcher | undefined } = { applied: un
 class GlobalRoutingDispatcher {
   readonly __piProxyRouterGlobalDispatcher: { fallback: Dispatcher };
   private readonly fallback: Dispatcher;
-  private readonly noproxyFlag: boolean;
 
-  constructor(fallback: Dispatcher, noproxyFlag: boolean) {
+  constructor(fallback: Dispatcher) {
     this.fallback = fallback;
-    this.noproxyFlag = noproxyFlag;
     this.__piProxyRouterGlobalDispatcher = { fallback };
   }
 
   dispatch(options: any, handler: any): boolean {
-    const route = resolveGlobalRoute(this.noproxyFlag, options);
+    const route = resolveGlobalRoute(activeNoproxyFlag, options);
     if (route.matched) {
-      const dispatcher = getRouteDispatcher(route.url);
-      if (dispatcher) return dispatcher.dispatch(options, handler);
-      logError(`unsupported global proxy URL, going direct: ${route.url}`);
+      return getRouteDispatcher(route.url).dispatch(options, handler);
     }
     return this.fallback.dispatch(options, handler);
   }
@@ -268,7 +360,6 @@ function ensureGlobalDispatcher(noproxyFlag: boolean): void {
   if (current === globalDispatcherState.applied) return;
   const dispatcher = new GlobalRoutingDispatcher(
     unwrapManagedDispatcher(current),
-    noproxyFlag,
   ) as unknown as Dispatcher;
   setGlobalDispatcher(dispatcher);
   globalDispatcherState.applied = dispatcher;
@@ -305,12 +396,166 @@ function resolveGlobalRoute(noproxyFlag: boolean, options: any): RouteDecision {
 
   const url = getRequestUrl(options);
   if (!url) return { matched: false, url: null };
+
   const provider = resolveAuthProvider(url);
-  if (!provider) return { matched: false, url: null };
-  const rule = loadRules().authRules.find((entry) => entry.provider === provider);
-  if (!rule) return { matched: false, url: null };
-  log(`auth route: ${provider}${url.pathname} -> ${displayProxyUrl(rule.url)}`);
-  return { matched: true, url: rule.url };
+  if (provider) {
+    const rule = loadRules().authRules.find((entry) => entry.provider === provider);
+    if (rule) {
+      log(`auth route: ${provider}${url.pathname} -> ${displayProxyUrl(rule.url)}`);
+      return { matched: true, url: rule.url };
+    }
+  }
+
+  const modelRoute = resolveModelEndpointRoute(url);
+  if (modelRoute) return modelRoute;
+  return { matched: false, url: null };
+}
+
+function routeStreamOptions(
+  noproxyFlag: boolean,
+  model: Model<any>,
+  options?: StreamOptions,
+): StreamOptions | undefined {
+  const route = resolveModelRoute(noproxyFlag, model.provider, model.id);
+  if (!route.matched) return options;
+
+  const dispatcher = getRouteDispatcher(route.url);
+  const routedOptions: StreamOptions = {
+    ...options,
+    fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+      try {
+        return (await undiciFetch(input as never, {
+          ...(init as Record<string, unknown>),
+          dispatcher: dispatcher as never,
+        } as never)) as unknown as Response;
+      } catch (err) {
+        logError("proxyFetch failed:", err);
+        throw err;
+      }
+    }) as never,
+  };
+
+  // openai-codex-responses may choose WebSocket by default. A routed proxy
+  // supports the HTTP/SSE path; force that path instead of leaking a direct WS.
+  if (model.provider === "openai-codex" && route.url !== null) {
+    routedOptions.transport = "sse";
+  }
+  log(`route: ${model.provider}/${model.id} -> ${displayProxyUrl(route.url)}`);
+  return routedOptions;
+}
+
+const ROUTED_PROVIDER = Symbol.for("pi-proxy-router.routed-provider");
+
+type ProviderMarker = {
+  original: any;
+  noproxyFlag: boolean;
+};
+
+type ModelRegistryLike = {
+  getAll?: () => readonly Model<any>[];
+  getProvider?: (provider: string) => any;
+  registerProvider?: (provider: any) => void;
+};
+
+function providerOriginal(provider: any): any {
+  let original = provider;
+  const seen = new Set<any>();
+  while (!seen.has(original)) {
+    seen.add(original);
+    const marker = original?.[ROUTED_PROVIDER] as ProviderMarker | undefined;
+    if (!marker?.original) break;
+    original = marker.original;
+  }
+  return original;
+}
+
+function makeRoutedProvider(base: any, noproxyFlag: boolean): any {
+  const wrapped = { ...base };
+  wrapped.streamSimple = (model: Model<any>, context: Context, options?: SimpleStreamOptions) =>
+    base.streamSimple(model, context, routeStreamOptions(noproxyFlag, model, options));
+  if (typeof base.stream === "function") {
+    wrapped.stream = (model: Model<any>, context: Context, options?: StreamOptions) =>
+      base.stream(model, context, routeStreamOptions(noproxyFlag, model, options));
+  }
+  Object.defineProperty(wrapped, ROUTED_PROVIDER, {
+    value: { original: base, noproxyFlag } satisfies ProviderMarker,
+    enumerable: false,
+  });
+  return wrapped;
+}
+
+function syncModelRouting(noproxyFlag: boolean, registry: ModelRegistryLike | undefined): void {
+  if (!registry?.getAll) return;
+  let models: readonly Model<any>[];
+  try {
+    models = registry.getAll();
+  } catch (err) {
+    logError("cannot read model registry:", err);
+    return;
+  }
+
+  refreshModelEndpointRoutes(models);
+  ensureWebSocketFallback();
+
+  if (!registry.getProvider || !registry.registerProvider) return;
+  const providerIds = new Set(models.map((model) => model.provider));
+  for (const providerId of providerIds) {
+    const current = registry.getProvider(providerId);
+    if (!current) continue;
+    const original = providerOriginal(current);
+    const shouldWrap = models.some(
+      (model) =>
+        model.provider === providerId &&
+        resolveModelRoute(noproxyFlag, model.provider, model.id).matched,
+    );
+    const marker = current[ROUTED_PROVIDER] as ProviderMarker | undefined;
+    try {
+      if (shouldWrap) {
+        if (!marker || marker.noproxyFlag !== noproxyFlag) {
+          registry.registerProvider(makeRoutedProvider(original, noproxyFlag));
+        }
+      } else if (marker) {
+        registry.registerProvider(original);
+      }
+    } catch (err) {
+      logError(`cannot install model route for provider ${providerId}:`, err);
+    }
+  }
+}
+
+type WebSocketConstructor = new (...args: any[]) => any;
+let wrappedWebSocket: WebSocketConstructor | undefined;
+
+function shouldFallbackWebSocket(value: unknown): boolean {
+  if (activeNoproxyFlag || commandDisabled) return false;
+  try {
+    const url = new URL(String(value));
+    const route = resolveModelEndpointRoute(url);
+    return Boolean(route?.matched && (allProxyUrl !== null || route.url !== null));
+  } catch {
+    return false;
+  }
+}
+
+function ensureWebSocketFallback(): void {
+  const globals = globalThis as unknown as { WebSocket?: WebSocketConstructor };
+  const current = globals.WebSocket;
+  if (!current || current === wrappedWebSocket) return;
+  const BaseWebSocket = current as any;
+  const RoutedWebSocket = class extends BaseWebSocket {
+    constructor(...args: any[]) {
+      if (shouldFallbackWebSocket(args[0])) {
+        throw new Error("pi-proxy-router: routed WebSocket is disabled; retrying with SSE");
+      }
+      super(...args);
+    }
+  } as WebSocketConstructor;
+  try {
+    globals.WebSocket = RoutedWebSocket;
+    wrappedWebSocket = RoutedWebSocket;
+  } catch (err) {
+    logError("cannot install WebSocket fallback:", err);
+  }
 }
 
 export default function (pi: ExtensionAPI) {
@@ -324,6 +569,7 @@ export default function (pi: ExtensionAPI) {
   // session replacement. Snapshot the immutable CLI flag here so those
   // callbacks never call methods on the old ExtensionAPI instance later.
   const noproxyFlag = Boolean(pi.getFlag("noproxy"));
+  activeNoproxyFlag = noproxyFlag;
 
   pi.registerCommand("proxy", {
     description:
@@ -355,6 +601,7 @@ export default function (pi: ExtensionAPI) {
       for (const r of rules.authRules) {
         lines.push(`    ${r.provider.padEnd(24)} -> ${displayProxyUrl(r.url)}`);
       }
+      lines.push(`  model endpoint fallbacks: ${modelEndpointRoutes.length}`);
       if (target) {
         const slash = target.indexOf("/");
         if (slash > 0 && slash < target.length - 1) {
@@ -381,6 +628,7 @@ export default function (pi: ExtensionAPI) {
       else if (arg === "off") commandDisabled = true;
       else commandDisabled = !commandDisabled;
       applyAllProxy(noproxyFlag);
+      syncModelRouting(noproxyFlag, ctx.modelRegistry);
       const state = commandDisabled ? "off (direct)" : "on (rules active)";
       log(`/noproxy -> ${state}`);
       ctx.ui.notify(`proxy-router: ${state}`, "info");
@@ -395,6 +643,7 @@ export default function (pi: ExtensionAPI) {
       if (!url) {
         allProxyUrl = null;
         applyAllProxy(noproxyFlag);
+        syncModelRouting(noproxyFlag, ctx.modelRegistry);
         log("/allproxy -> off (rules active)");
         ctx.ui.notify("proxy-router: /allproxy off", "info");
         return;
@@ -405,94 +654,28 @@ export default function (pi: ExtensionAPI) {
       }
       allProxyUrl = url;
       applyAllProxy(noproxyFlag);
+      syncModelRouting(noproxyFlag, ctx.modelRegistry);
       log(`/allproxy -> ${displayProxyUrl(url)} (all models)`);
       ctx.ui.notify(`proxy-router: all models -> ${displayProxyUrl(url)}`, "info");
     },
   });
 
-  // 运行时由 pi 的扩展加载器 alias 到内置 compat 入口（re-export
-  // openAIResponsesApi / openAICodexResponsesApi）；npm 类型包未导出
-  // 这些符号，这里按结构断言。
-  type ResponsesApi = {
-    streamSimple: (
-      model: Model<any>,
-      context: Context,
-      options?: SimpleStreamOptions,
-    ) => AssistantMessageEventStream;
-  };
-  const { openAIResponsesApi, openAICodexResponsesApi } = piAi as unknown as {
-    openAIResponsesApi: () => ResponsesApi;
-    openAICodexResponsesApi: () => ResponsesApi;
-  };
-
-  const makeRouteResponses =
-    (api: ResponsesApi) =>
-    (
-      model: Model<any>,
-      context: Context,
-      options?: SimpleStreamOptions,
-    ): AssistantMessageEventStream => {
-      const route = resolveModelRoute(noproxyFlag, model.provider, model.id);
-      const proxyUrl = route.matched ? route.url : null;
-      const forceCodexSse =
-        model.provider === "openai-codex" &&
-        Boolean(proxyUrl);
-      log(
-        `route: ${model.provider}/${model.id} -> ${displayProxyUrl(proxyUrl)}`,
-      );
-      if (route.matched) {
-        const dispatcher = getRouteDispatcher(route.url);
-        if (dispatcher) {
-          const routedOptions: SimpleStreamOptions = {
-            ...options,
-            fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
-              try {
-                return (await undiciFetch(input as never, {
-                  ...(init as Record<string, unknown>),
-                  dispatcher: dispatcher as never,
-                } as never)) as unknown as Response;
-              } catch (err) {
-                logError("proxyFetch failed:", err);
-                throw err;
-              }
-            }) as never,
-          };
-          if (forceCodexSse) routedOptions.transport = "sse";
-          return api.streamSimple(model, context, routedOptions);
-        }
-        logError(`unsupported proxy URL, going direct: ${displayProxyUrl(proxyUrl)}`);
-      }
-      if (forceCodexSse) {
-        return api.streamSimple(model, context, {
-          ...options,
-          transport: "sse",
-        });
-      }
-      return api.streamSimple(model, context, options);
-    };
-
-  const routeResponses = makeRouteResponses(openAIResponsesApi());
-  const routeCodexResponses = makeRouteResponses(openAICodexResponsesApi());
-
-  // 只接管对应 api 的模型；其余 api 的模型走默认实现
-  pi.registerProvider("opencode-go", {
-    api: "openai-responses",
-    streamSimple: routeResponses,
-  });
-  pi.registerProvider("openai", {
-    api: "openai-responses",
-    streamSimple: routeResponses,
-  });
-  pi.registerProvider("openai-codex", {
-    api: "openai-codex-responses",
-    streamSimple: routeCodexResponses,
+  // The model registry wrapper covers every provider/API in the current session,
+  // including openai-completions and anthropic-messages. The URL-level fallback
+  // remains active for foreground subagents that do not load this extension.
+  pi.on("session_start", (_event, ctx) => {
+    syncModelRouting(noproxyFlag, ctx.modelRegistry);
   });
 
   // Pi may recreate its default dispatcher while runtime settings change.
-  // Reinstall the auth-aware wrapper before a model turn when needed.
-  pi.on("before_agent_start", () => applyAllProxy(noproxyFlag));
+  // Reinstall the auth/model-aware wrapper before every model turn.
+  pi.on("before_agent_start", (_event, ctx) => {
+    applyAllProxy(noproxyFlag);
+    syncModelRouting(noproxyFlag, ctx.modelRegistry);
+  });
 
   ensureGlobalDispatcher(noproxyFlag);
+  ensureWebSocketFallback();
   const rules = loadRules();
   log(
     `loaded (${rules.modelRules.length} model rules, ${rules.authRules.length} auth rules ` +

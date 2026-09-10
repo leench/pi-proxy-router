@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Route all model API types through the current model registry instead of only `openai-responses` and `openai-codex-responses`.
+- Keep model proxy rules effective for foreground subagents through process-wide endpoint routing, including Codex WebSocket-to-SSE fallback.
+- Add built-in OAuth endpoint mappings for Anthropic, GitHub Copilot, Kimi Coding, OpenRouter, and xAI.
+- Fail instead of silently connecting directly when a configured proxy URL uses an unsupported protocol.
+
 ## 1.2.1 - 2026-09-07
 
 ### Fixed
