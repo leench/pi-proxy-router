@@ -238,8 +238,15 @@ type ModelEndpointRoute = {
   route: RouteDecision;
 };
 
+type ModelEndpointGroup = {
+  base: URL;
+  basePath: string;
+  models: { target: string; route: RouteDecision }[];
+};
+
 // Foreground subagents run in the parent process without ambient extensions.
-// Keep a URL-level route table as a process-wide fallback for their model calls.
+// A URL cannot identify its model, so only install a fallback when every known
+// model sharing that endpoint resolves to the same routing decision.
 let knownModels: readonly Model<any>[] = [];
 let modelEndpointRoutes: ModelEndpointRoute[] = [];
 let endpointRoutesRules: LoadedRules | null = null;
@@ -267,29 +274,46 @@ function endpointMatches(url: URL, route: ModelEndpointRoute): boolean {
 }
 
 function rebuildModelEndpointRoutes(): void {
-  const byBase = new Map<string, ModelEndpointRoute>();
+  const byBase = new Map<string, ModelEndpointGroup>();
   for (const model of knownModels) {
     const route = resolveModelRoute(false, model.provider, model.id);
-    if (!route.matched) continue;
     const normalized = normalizeEndpointBase(model.baseUrl);
     if (!normalized) {
-      logError(`cannot route model with invalid base URL: ${model.provider}/${model.id}`);
+      if (route.matched) {
+        logError(`cannot route model with invalid base URL: ${model.provider}/${model.id}`);
+      }
       continue;
     }
     const key = normalized.base.toString();
-    const target = `${model.provider}/${model.id}`;
-    const existing = byBase.get(key);
-    if (existing && existing.route.url !== route.url) {
-      // The URL alone cannot distinguish two models sharing an endpoint. Keep the
-      // first route, but make the ambiguity visible instead of silently falling back.
-      logError(`conflicting model rules share endpoint ${key}: ${existing.target}, ${target}`);
-    } else if (!existing) {
-      byBase.set(key, { ...normalized, target, route });
-    }
+    const group = byBase.get(key) ?? { ...normalized, models: [] };
+    group.models.push({ target: `${model.provider}/${model.id}`, route });
+    byBase.set(key, group);
   }
-  modelEndpointRoutes = [...byBase.values()].sort(
-    (a, b) => b.basePath.length - a.basePath.length,
-  );
+
+  const routes: ModelEndpointRoute[] = [];
+  for (const [key, group] of byBase) {
+    const first = group.models[0];
+    if (!first) continue;
+    const conflict = group.models.find(
+      ({ route }) => route.matched !== first.route.matched || route.url !== first.route.url,
+    );
+    if (conflict) {
+      logError(
+        `conflicting model rules share endpoint ${key}: ${first.target}, ${conflict.target}; ` +
+          "skipping URL fallback",
+      );
+      continue;
+    }
+    if (!first.route.matched) continue;
+    routes.push({
+      base: group.base,
+      basePath: group.basePath,
+      target: first.target,
+      route: first.route,
+    });
+  }
+
+  modelEndpointRoutes = routes.sort((a, b) => b.basePath.length - a.basePath.length);
   endpointRoutesRules = loadRules();
 }
 

@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 1.2.3 - 2026-09-23
+
+### Fixed
+
+- Prevent process-wide endpoint fallback from applying a proxy rule to models sharing a `baseUrl` when their model-level routing decisions differ.
+
+## 1.2.2 - 2026-09-10
 
 ### Fixed
 

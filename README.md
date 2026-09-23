@@ -143,7 +143,7 @@ Pi installs an `EnvHttpProxyAgent` globally at startup, so all fetch calls read 
 
 ## Known limitations
 
-- The endpoint fallback relies on `baseUrl` from the current model registry. If different models share one base URL but have different proxy rules, URL-level routing cannot distinguish them; the first matching route is retained and a debug log is emitted. Use the same proxy rule for those models or separate endpoints.
+- The endpoint fallback relies on `baseUrl` from the current model registry. Since a URL cannot identify the model for a request, the extension installs a fallback only when all known models sharing that endpoint resolve to the same routing decision. If a model is unrouted or has a different route, it logs a debug message and skips that endpoint fallback. The current session's provider wrapper still applies rules by model ID; requests without that wrapper use Pi's default pipeline. To proxy foreground subagent requests by model, use a consistent rule for models sharing an endpoint or configure separate endpoints.
 - `/allproxy` covers Pi's process HTTP(S) traffic only while it is active; it does not cover browser navigation, arbitrary child-process networking, unrelated native WebSocket clients, or the standalone `pi auth ...` command handled before extensions load.
 - `auth` only covers built-in provider auth endpoint mappings; adding a provider requires adding its endpoint mapping, not an arbitrary URL wildcard.
 

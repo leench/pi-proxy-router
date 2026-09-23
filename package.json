@@ -1,6 +1,6 @@
 {
   "name": "pi-proxy-router",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "Per-model and auth-flow proxy routing for pi with session commands (/proxy, /noproxy, /allproxy) and dedicated proxy-router.json rules",
   "keywords": [
     "pi-package",

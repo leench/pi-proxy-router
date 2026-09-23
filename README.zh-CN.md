@@ -141,7 +141,7 @@ pi 启动时全局安装 `EnvHttpProxyAgent`（undici），所有 fetch 默认�
 
 ## 已知限制
 
-- endpoint 兜底依赖当前 model registry 提供的 `baseUrl`；同一 base URL 上若不同模型配置了不同代理，URL 层无法区分，扩展会保留首个匹配规则并输出 debug 日志。此类模型应使用相同代理规则或改用不同 endpoint。
+- endpoint 兜底依赖当前 model registry 提供的 `baseUrl`。由于 URL 无法识别请求对应的模型，扩展只在共享该 endpoint 的所有已知模型路由结果一致时安装兜底；若有模型未命中规则或路由不同，会输出 debug 日志并跳过该 endpoint 兜底。当前 session 的 provider wrapper 仍按模型 ID 应用规则；未经过 wrapper 的请求则回到 Pi 默认链路。需要前台子 agent 也按模型规则代理时，应让共享 endpoint 的模型使用一致规则，或配置不同 endpoint。
 - `/allproxy` 只在启用期间覆盖 Pi 进程内的 HTTP(S) 流量，不包括浏览器导航、任意子进程自己的网络请求、无关的原生 WebSocket 客户端，以及扩展加载前处理的独立 `pi auth ...` 命令。
 - `auth` 只覆盖扩展内置的 provider 认证 endpoint；新增 provider 需要补充 endpoint 映射，不接受任意 URL 通配。
 
