@@ -42,6 +42,7 @@ pi install npm:pi-proxy-router
 ## Compatibility and upgrade
 
 - `1.2.1` supports the Undici 8 Dispatcher used by Pi 0.85.x while retaining compatibility with the Undici 7 Dispatcher.
+- With Pi 1.0, the `openai` provider's "Sign in with ChatGPT" token endpoint (`auth.openai.com/api/accounts/oauth/token`) uses the `openai` auth rule, non-chat provider requests (deferred fetch/cancel, image generation, classification) are routed per model like chat, and image/classifier models join the endpoint fallback.
 - If Pi exits with `handler.onHeaders is not a function`, update the extension and restart Pi; existing proxy configuration does not need to change.
 - The unreleased routing changes also cover all model API types and foreground subagents; see `CHANGELOG.md` for details.
 
@@ -59,7 +60,8 @@ Use a dedicated config file: global `~/.pi/agent/proxy-router.json`, or project 
     "opencode-go/glm*":      "direct"
   },
   "auth": {
-    "openai-codex": "socks5h://127.0.0.1:7890"
+    "openai-codex": "socks5h://127.0.0.1:7890",
+    "openai":       "socks5h://127.0.0.1:7890"
   }
 }
 ```
@@ -87,6 +89,7 @@ For migration, legacy global/project `settings.json` entries under `proxy-router
 `auth` rules currently cover these built-in endpoints:
 
 - `openai-codex`: `auth.openai.com/oauth/token`, `auth.openai.com/api/accounts/deviceauth/usercode`, `auth.openai.com/api/accounts/deviceauth/token`
+- `openai`: `auth.openai.com/api/accounts/oauth/token` ("Sign in with ChatGPT" token exchange and refresh)
 - `anthropic`: `platform.claude.com/v1/oauth/token`
 - `github-copilot`: GitHub device/OAuth endpoints and `api.github.com` / `api.individual.githubcopilot.com` Copilot token endpoints
 - `kimi-coding`: `auth.kimi.com/api/oauth/device_authorization`, `auth.kimi.com/api/oauth/token`
@@ -111,8 +114,8 @@ Token exchange, refresh, and device-code requests from an in-session `/login` fl
 
 This extension has three routing layers:
 
-- `models` wraps `stream` / `streamSimple` in the current session's model registry, resolves rules by model id for every API type, and injects undici fetch with a custom dispatcher.
-- The process-wide dispatcher also routes known model endpoints by their `baseUrl`, covering foreground children and HTTP APIs that bypass the provider wrapper.
+- `models` wraps `stream` / `streamSimple` in the current session's model registry, resolves rules by model id for every API type, and injects undici fetch with a custom dispatcher. Deferred fetch/cancel, image generation, and classification requests of wrapped providers use the same per-model rule.
+- The process-wide dispatcher also routes known model endpoints by their `baseUrl` (chat, image, and classifier models), covering foreground children and HTTP APIs that bypass the provider wrapper.
 - `auth` installs a process-wide wrapper around Pi's default dispatcher. It selects a provider dispatcher only for known OAuth endpoints and delegates all other requests to Pi's original pipeline.
 
 - `http://` / `https://` → undici `ProxyAgent`

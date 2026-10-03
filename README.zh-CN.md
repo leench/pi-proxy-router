@@ -40,6 +40,7 @@ pi install npm:pi-proxy-router
 ## 兼容性与升级
 
 - `1.2.1` 兼容 Pi 0.85.x 使用的 Undici 8 Dispatcher，同时保留对 Undici 7 Dispatcher 的兼容。
+- 在 Pi 1.0 下，`openai` provider 的 “Sign in with ChatGPT” token endpoint（`auth.openai.com/api/accounts/oauth/token`）交由 `openai` auth 规则处理；非聊天请求（deferred fetch/cancel、图片生成、分类）与 chat 一样按模型路由；image/classifier 模型参与 endpoint 兜底。
 - 如果 Pi 出现 `handler.onHeaders is not a function` 并退出，更新扩展后重启 Pi；不需要修改现有代理配置。
 - 未发布的路由更新还覆盖了所有模型 API 类型和前台子 agent；详见 `CHANGELOG.md`。
 
@@ -57,7 +58,8 @@ pi install npm:pi-proxy-router
     "opencode-go/glm*":      "direct"
   },
   "auth": {
-    "openai-codex": "socks5h://127.0.0.1:7890"
+    "openai-codex": "socks5h://127.0.0.1:7890",
+    "openai":       "socks5h://127.0.0.1:7890"
   }
 }
 ```
@@ -85,6 +87,7 @@ pi install npm:pi-proxy-router
 `auth` 规则只覆盖扩展已经声明的 Pi 认证 endpoint。目前支持：
 
 - `openai-codex`：`auth.openai.com/oauth/token`、`auth.openai.com/api/accounts/deviceauth/usercode`、`auth.openai.com/api/accounts/deviceauth/token`
+- `openai`：`auth.openai.com/api/accounts/oauth/token`（“Sign in with ChatGPT” 的 token exchange 与 refresh）
 - `anthropic`：`platform.claude.com/v1/oauth/token`
 - `github-copilot`：GitHub device/oauth endpoint 及 `api.github.com` / `api.individual.githubcopilot.com` Copilot token endpoint
 - `kimi-coding`：`auth.kimi.com/api/oauth/device_authorization`、`auth.kimi.com/api/oauth/token`
@@ -109,8 +112,8 @@ pi install npm:pi-proxy-router
 
 本扩展有三层路由：
 
-- `models` 在当前 session 的 model registry 中包装 provider 的 `stream` / `streamSimple`，按模型 id 解析规则，覆盖所有 API 类型，并用 undici fetch + 自定义 dispatcher 注入传输层。
-- 进程级 dispatcher 根据已知模型的 `baseUrl` 再做 endpoint 路由，覆盖未加载本扩展的前台子 agent 和未使用 provider wrapper 的 HTTP API。
+- `models` 在当前 session 的 model registry 中包装 provider 的 `stream` / `streamSimple`，按模型 id 解析规则，覆盖所有 API 类型，并用 undici fetch + 自定义 dispatcher 注入传输层。已包装 provider 的 deferred fetch/cancel、图片生成与分类请求使用同一套逐模型规则。
+- 进程级 dispatcher 根据已知模型（chat、image、classifier）的 `baseUrl` 再做 endpoint 路由，覆盖未加载本扩展的前台子 agent 和未使用 provider wrapper 的 HTTP API。
 - `auth` 在 Pi 进程内安装一个保留默认 dispatcher 的路由包装器，只对已知 OAuth endpoint 选择认证 provider 的 dispatcher，其他请求继续交给 Pi 默认链路。
 
 - `http://` / `https://` → undici `ProxyAgent`

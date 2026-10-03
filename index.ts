@@ -3,7 +3,18 @@ import type {
   ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 import type {
+  ClassifierApi,
+  ClassifierContext,
+  ClassifierModel,
+  ClassifierOptions,
   Context,
+  DeferredCancelOptions,
+  DeferredFetchOptions,
+  DeferredHandle,
+  ImageApi,
+  ImageModel,
+  ImagesContext,
+  ImagesOptions,
   Model,
   SimpleStreamOptions,
   StreamOptions,
@@ -210,6 +221,13 @@ const AUTH_ENDPOINTS = [
     hostname: "auth.openai.com",
     path: /^\/(?:oauth\/token|api\/accounts\/deviceauth\/(?:usercode|token))$/,
   },
+  {
+    // Pi's `openai` provider ("Sign in with ChatGPT") exchanges and refreshes
+    // tokens on a different path than openai-codex, on the same host.
+    provider: "openai",
+    hostname: "auth.openai.com",
+    path: /^\/api\/accounts\/oauth\/token$/,
+  },
   { provider: "anthropic", hostname: "platform.claude.com", path: /^\/v1\/oauth\/token$/ },
   {
     provider: "github-copilot",
@@ -244,10 +262,19 @@ type ModelEndpointGroup = {
   models: { target: string; route: RouteDecision }[];
 };
 
+// Routing only needs the provider and model id; every model type carries them.
+type RoutedModel = { provider: string; id: string };
+
+// The model fields the endpoint fallback needs, shared by chat, image, and
+// classifier models (Model/ImageModel/ClassifierModel all carry these).
+type KnownModel = RoutedModel & {
+  baseUrl: string;
+};
+
 // Foreground subagents run in the parent process without ambient extensions.
 // A URL cannot identify its model, so only install a fallback when every known
 // model sharing that endpoint resolves to the same routing decision.
-let knownModels: readonly Model<any>[] = [];
+let knownModels: readonly KnownModel[] = [];
 let modelEndpointRoutes: ModelEndpointRoute[] = [];
 let endpointRoutesRules: LoadedRules | null = null;
 
@@ -317,7 +344,7 @@ function rebuildModelEndpointRoutes(): void {
   endpointRoutesRules = loadRules();
 }
 
-function refreshModelEndpointRoutes(models: readonly Model<any>[]): void {
+function refreshModelEndpointRoutes(models: readonly KnownModel[]): void {
   knownModels = [...models];
   rebuildModelEndpointRoutes();
 }
@@ -440,32 +467,56 @@ function routeStreamOptions(
   model: Model<any>,
   options?: StreamOptions,
 ): StreamOptions | undefined {
-  const route = resolveModelRoute(noproxyFlag, model.provider, model.id);
-  if (!route.matched) return options;
+  const route = modelFetchRoute(noproxyFlag, model);
+  if (!route) return options;
 
-  const dispatcher = getRouteDispatcher(route.url);
-  const routedOptions: StreamOptions = {
-    ...options,
-    fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
-      try {
-        return (await undiciFetch(input as never, {
-          ...(init as Record<string, unknown>),
-          dispatcher: dispatcher as never,
-        } as never)) as unknown as Response;
-      } catch (err) {
-        logError("proxyFetch failed:", err);
-        throw err;
-      }
-    }) as never,
-  };
+  const routedOptions: StreamOptions = { ...options, fetch: route.fetch };
 
   // openai-codex-responses may choose WebSocket by default. A routed proxy
   // supports the HTTP/SSE path; force that path instead of leaking a direct WS.
   if (model.provider === "openai-codex" && route.url !== null) {
     routedOptions.transport = "sse";
   }
-  log(`route: ${model.provider}/${model.id} -> ${displayProxyUrl(route.url)}`);
   return routedOptions;
+}
+
+// Per-model route decision plus the fetch bound to that route's dispatcher.
+// Undefined means the model has no rule, so callers keep the options as-is.
+function modelFetchRoute(
+  noproxyFlag: boolean,
+  model: RoutedModel,
+): { fetch: NonNullable<StreamOptions["fetch"]>; url: string | null } | undefined {
+  const route = resolveModelRoute(noproxyFlag, model.provider, model.id);
+  if (!route.matched) return undefined;
+
+  const dispatcher = getRouteDispatcher(route.url);
+  const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    try {
+      return (await undiciFetch(input as never, {
+        ...(init as Record<string, unknown>),
+        dispatcher: dispatcher as never,
+      } as never)) as unknown as Response;
+    } catch (err) {
+      logError("proxyFetch failed:", err);
+      throw err;
+    }
+  }) as NonNullable<StreamOptions["fetch"]>;
+
+  log(`route: ${model.provider}/${model.id} -> ${displayProxyUrl(route.url)}`);
+  return { fetch, url: route.url };
+}
+
+// Deferred fetch/cancel, image generation, and classification take the same
+// provider request options as chat (fetch, headers, signal, ...) but no
+// transport: inject the routed fetch and keep every other option untouched.
+function routeProviderRequest<TOptions extends { fetch?: unknown }>(
+  noproxyFlag: boolean,
+  model: RoutedModel,
+  options: TOptions | undefined,
+): TOptions | undefined {
+  const route = modelFetchRoute(noproxyFlag, model);
+  if (!route) return options;
+  return { ...options, fetch: route.fetch } as TOptions;
 }
 
 const ROUTED_PROVIDER = Symbol.for("pi-proxy-router.routed-provider");
@@ -476,7 +527,9 @@ type ProviderMarker = {
 };
 
 type ModelRegistryLike = {
-  getAll?: () => readonly Model<any>[];
+  getAll?: () => readonly KnownModel[];
+  /** `getAll()` returns chat models only; image and classifier models need this. */
+  getModelsOfType?: (type: "image" | "classifier") => readonly KnownModel[];
   getProvider?: (provider: string) => any;
   registerProvider?: (provider: any) => void;
 };
@@ -501,6 +554,36 @@ function makeRoutedProvider(base: any, noproxyFlag: boolean): any {
     wrapped.stream = (model: Model<any>, context: Context, options?: StreamOptions) =>
       base.stream(model, context, routeStreamOptions(noproxyFlag, model, options));
   }
+  // Non-chat model requests are wrapped per model too. Methods the provider
+  // does not implement stay absent so Pi keeps reporting "unsupported".
+  if (typeof base.fetchDeferred === "function") {
+    wrapped.fetchDeferred = (
+      model: Model<any>,
+      handle: DeferredHandle,
+      options?: DeferredFetchOptions,
+    ) => base.fetchDeferred(model, handle, routeProviderRequest(noproxyFlag, model, options));
+  }
+  if (typeof base.cancelDeferred === "function") {
+    wrapped.cancelDeferred = (
+      model: Model<any>,
+      handle: DeferredHandle,
+      options?: DeferredCancelOptions,
+    ) => base.cancelDeferred(model, handle, routeProviderRequest(noproxyFlag, model, options));
+  }
+  if (typeof base.generateImages === "function") {
+    wrapped.generateImages = (
+      model: ImageModel<ImageApi>,
+      context: ImagesContext,
+      options?: ImagesOptions,
+    ) => base.generateImages(model, context, routeProviderRequest(noproxyFlag, model, options));
+  }
+  if (typeof base.classify === "function") {
+    wrapped.classify = (
+      model: ClassifierModel<ClassifierApi>,
+      context: ClassifierContext,
+      options?: ClassifierOptions,
+    ) => base.classify(model, context, routeProviderRequest(noproxyFlag, model, options));
+  }
   Object.defineProperty(wrapped, ROUTED_PROVIDER, {
     value: { original: base, noproxyFlag } satisfies ProviderMarker,
     enumerable: false,
@@ -510,12 +593,24 @@ function makeRoutedProvider(base: any, noproxyFlag: boolean): any {
 
 function syncModelRouting(noproxyFlag: boolean, registry: ModelRegistryLike | undefined): void {
   if (!registry?.getAll) return;
-  let models: readonly Model<any>[];
+  let models: readonly KnownModel[];
   try {
     models = registry.getAll();
   } catch (err) {
     logError("cannot read model registry:", err);
     return;
+  }
+
+  // Chat models come from getAll(); image and classifier models share provider
+  // base URLs, so they take part in the endpoint fallback and provider wrapping.
+  if (registry.getModelsOfType) {
+    for (const type of ["image", "classifier"] as const) {
+      try {
+        models = [...models, ...registry.getModelsOfType(type)];
+      } catch (err) {
+        logError(`cannot read ${type} models from registry:`, err);
+      }
+    }
   }
 
   refreshModelEndpointRoutes(models);
